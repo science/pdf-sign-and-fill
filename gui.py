@@ -1,7 +1,8 @@
+import os
 import sys
 from datetime import date
 
-from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSettings
 from PyQt6.QtGui import (
     QPixmap, QPainter, QFont, QColor, QFontDatabase,
     QKeySequence, QAction, QPen, QFontMetricsF,
@@ -10,7 +11,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QScrollArea, QWidget, QToolBar,
     QFileDialog, QLabel, QInputDialog, QStatusBar, QPushButton,
     QMessageBox, QRadioButton, QSpinBox,
-    QComboBox, QColorDialog,
+    QComboBox, QColorDialog, QDialog, QFormLayout, QLineEdit,
+    QDialogButtonBox,
 )
 
 from pdfsign.core import PdfDocument
@@ -29,6 +31,31 @@ FONTS = {
 }
 
 HANDLE_SIZE = 8  # pixels for resize handles
+MAX_RECENT_TEXTS = 10
+DEFAULT_RECENT_TEXTS = ["Signed {date}", "{name}", "{name} - {date}", "{date}"]
+
+
+def expand_variables(template, settings_vars):
+    """Expand {date}, {name} etc. in a template string."""
+    result = template
+    result = result.replace("{date}", str(date.today()))
+    result = result.replace("{name}", settings_vars.get("name", ""))
+    return result
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None, current_name=""):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        layout = QFormLayout(self)
+        self.name_edit = QLineEdit(current_name)
+        layout.addRow("Name:", self.name_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
 
 
 class PdfCanvas(QWidget):
@@ -222,12 +249,15 @@ class PdfCanvas(QWidget):
         self.selected_index = -1
 
         if mw.mode == "text":
+            template = mw.recent_combo.currentText() or DEFAULT_TEXT
+            expanded = mw._expand_text(template)
             text, ok = QInputDialog.getText(
-                self, "Add Text", "Text:", text=DEFAULT_TEXT,
+                self, "Add Text", "Text:", text=expanded,
             )
             if not ok or not text:
                 self.update()
                 return
+            mw._add_recent_text(template)
             mw.doc.add_text(
                 mw.current_page, pdf_x, pdf_y,
                 text, mw.current_font_path(),
@@ -277,16 +307,47 @@ class PdfCanvas(QWidget):
             new_x = self._resize_start_x
             new_y = self._resize_start_y
 
-            if "r" in h:
-                new_w = max(10, self._resize_start_w + dx)
-            if "l" in h:
-                new_w = max(10, self._resize_start_w - dx)
-                new_x = self._resize_start_x + (self._resize_start_w - new_w)
-            if "b" in h:
-                new_h = max(10, self._resize_start_h + dy)
-            if "t" in h:
-                new_h = max(10, self._resize_start_h - dy)
-                new_y = self._resize_start_y + (self._resize_start_h - new_h)
+            is_corner = len(h) == 2  # tl, tr, bl, br
+            if is_corner:
+                # Proportional resize: use the axis with larger movement
+                aspect = self._resize_start_w / max(self._resize_start_h, 0.01)
+                # Determine delta along the dominant drag direction
+                if "r" in h:
+                    d = dx
+                elif "l" in h:
+                    d = -dx
+                else:
+                    d = 0
+                if "b" in h:
+                    d_vert = dy
+                elif "t" in h:
+                    d_vert = -dy
+                else:
+                    d_vert = 0
+                # Use whichever delta is larger in magnitude
+                if abs(d) >= abs(d_vert):
+                    new_w = max(10, self._resize_start_w + (d if "r" in h else -d))
+                    new_h = max(10, new_w / aspect)
+                else:
+                    new_h = max(10, self._resize_start_h + (d_vert if "b" in h else -d_vert))
+                    new_w = max(10, new_h * aspect)
+                # Anchor the opposite corner
+                if "l" in h:
+                    new_x = self._resize_start_x + (self._resize_start_w - new_w)
+                if "t" in h:
+                    new_y = self._resize_start_y + (self._resize_start_h - new_h)
+            else:
+                # Edge handles: free resize in one axis
+                if h == "r":
+                    new_w = max(10, self._resize_start_w + dx)
+                elif h == "l":
+                    new_w = max(10, self._resize_start_w - dx)
+                    new_x = self._resize_start_x + (self._resize_start_w - new_w)
+                elif h == "b":
+                    new_h = max(10, self._resize_start_h + dy)
+                elif h == "t":
+                    new_h = max(10, self._resize_start_h - dy)
+                    new_y = self._resize_start_y + (self._resize_start_h - new_h)
 
             mw.doc.update_annotation(
                 self.selected_index,
@@ -334,7 +395,7 @@ class PdfCanvas(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF Sign")
+        self.setWindowTitle("PDF Simple Signing")
         self.doc = None
         self.current_page = 0
         self.zoom = DEFAULT_ZOOM
@@ -409,7 +470,14 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.radio_image)
 
         # Image controls
-        self.image_label = QLabel("No image")
+        self.image_label = QPushButton("No image")
+        self.image_label.setFlat(True)
+        self.image_label.setStyleSheet(
+            "QPushButton { text-decoration: underline; color: palette(link); }"
+            "QPushButton:hover { color: palette(highlight); }"
+        )
+        self.image_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.image_label.clicked.connect(self.quick_image_mode)
         toolbar.addWidget(self.image_label)
         toolbar.addAction("Choose...", self.choose_image)
 
@@ -452,6 +520,16 @@ class MainWindow(QMainWindow):
         text_toolbar.addWidget(self.color_btn)
         text_toolbar.addWidget(QLabel(" Color"))
 
+        text_toolbar.addSeparator()
+        text_toolbar.addWidget(QLabel(" Text: "))
+        self.recent_combo = QComboBox()
+        self.recent_combo.setEditable(True)
+        self.recent_combo.setMinimumWidth(200)
+        self.recent_combo.addItems(DEFAULT_RECENT_TEXTS)
+        text_toolbar.addWidget(self.recent_combo)
+
+        text_toolbar.addAction("Settings...", self.open_settings)
+
         # Keyboard shortcuts
         open_action = QAction("Open", self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
@@ -479,19 +557,110 @@ class MainWindow(QMainWindow):
         # Size the window
         self.resize(900, 700)
 
+        # Load persisted settings
+        self.load_settings()
+
         # Auto-open file dialog on launch
         self.open_file()
 
+    def _settings_vars(self):
+        """Return dict of variable values for template expansion."""
+        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        return {"name": s.value("user_name", "")}
+
+    def _expand_text(self, template):
+        return expand_variables(template, self._settings_vars())
+
+    def _add_recent_text(self, template):
+        """Add template to recent list (at top, no duplicates)."""
+        items = [self.recent_combo.itemText(i) for i in range(self.recent_combo.count())]
+        if template in items:
+            items.remove(template)
+        items.insert(0, template)
+        items = items[:MAX_RECENT_TEXTS]
+        self.recent_combo.clear()
+        self.recent_combo.addItems(items)
+        self.recent_combo.setCurrentIndex(0)
+
+    def open_settings(self):
+        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        current_name = s.value("user_name", "")
+        dlg = SettingsDialog(self, current_name)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            s.setValue("user_name", dlg.name_edit.text())
+
+    def load_settings(self):
+        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        # Window geometry
+        geo = s.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
+        # Image path
+        img = s.value("image_path", "")
+        if img and os.path.exists(img):
+            self.image_path = img
+            self.image_label.setText(img.split("/")[-1])
+        # Image size
+        self.img_width.setValue(int(s.value("img_width", 150)))
+        self.img_height.setValue(int(s.value("img_height", 50)))
+        # Font
+        font_name = s.value("font_name", "Liberation Sans")
+        idx = self.font_combo.findText(font_name)
+        if idx >= 0:
+            self.font_combo.setCurrentIndex(idx)
+        self.font_size.setValue(int(s.value("font_size", 12)))
+        # Color
+        color_str = s.value("text_color", "0,0,0")
+        parts = [float(x) for x in color_str.split(",")]
+        self.text_color = tuple(parts)
+        r, g, b = self.text_color
+        self.color_btn.setStyleSheet(
+            f"background-color: rgb({int(r*255)},{int(g*255)},{int(b*255)});"
+        )
+        # Zoom
+        zoom_val = float(s.value("zoom", DEFAULT_ZOOM))
+        if zoom_val in ZOOM_LEVELS:
+            self.zoom = zoom_val
+            self.zoom_label.setText(f" {int(self.zoom * 100)}% ")
+        # Last PDF directory
+        self._last_pdf_dir = s.value("last_pdf_dir", "")
+        # Recent texts
+        recent = s.value("recent_texts")
+        if recent and isinstance(recent, list):
+            self.recent_combo.clear()
+            self.recent_combo.addItems(recent)
+
+    def save_settings(self):
+        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        s.setValue("geometry", self.saveGeometry())
+        s.setValue("image_path", self.image_path)
+        s.setValue("img_width", self.img_width.value())
+        s.setValue("img_height", self.img_height.value())
+        s.setValue("font_name", self.font_combo.currentText())
+        s.setValue("font_size", self.font_size.value())
+        r, g, b = self.text_color
+        s.setValue("text_color", f"{r},{g},{b}")
+        s.setValue("zoom", self.zoom)
+        s.setValue("last_pdf_dir", getattr(self, "_last_pdf_dir", ""))
+        recent = [self.recent_combo.itemText(i) for i in range(self.recent_combo.count())]
+        s.setValue("recent_texts", recent[:MAX_RECENT_TEXTS])
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
+
     def open_file(self):
+        start_dir = getattr(self, "_last_pdf_dir", "")
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open PDF", "", "PDF Files (*.pdf)"
+            self, "Open PDF", start_dir, "PDF Files (*.pdf)"
         )
         if not path:
             return
+        self._last_pdf_dir = os.path.dirname(path)
         self.doc = PdfDocument(path)
         self.current_page = 0
         self.canvas.selected_index = -1
-        self.setWindowTitle(f"PDF Sign — {path}")
+        self.setWindowTitle(f"PDF Simple Signing — {path}")
         self.refresh_page()
 
     def save_file(self):
@@ -519,6 +688,12 @@ class MainWindow(QMainWindow):
     def current_font_path(self) -> str:
         name = self.font_combo.currentText()
         return FONTS.get(name, list(FONTS.values())[0])
+
+    def quick_image_mode(self):
+        if self.image_path and os.path.exists(self.image_path):
+            self.radio_image.setChecked(True)
+        else:
+            self.choose_image()
 
     def choose_image(self):
         path, _ = QFileDialog.getOpenFileName(

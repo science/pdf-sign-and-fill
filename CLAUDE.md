@@ -1,4 +1,4 @@
-# PDF Signing Tool
+# PDF Simple Signing
 
 Minimal tool to stamp text and images onto PDFs and save flattened output. Uses PyMuPDF to write directly to page content streams without parsing/re-rendering the original PDF layout.
 
