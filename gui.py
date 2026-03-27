@@ -1,8 +1,11 @@
 import sys
 from datetime import date
 
-from PyQt6.QtCore import Qt, QRectF
-from PyQt6.QtGui import QPixmap, QPainter, QFont, QColor, QFontDatabase, QKeySequence, QAction
+from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtGui import (
+    QPixmap, QPainter, QFont, QColor, QFontDatabase,
+    QKeySequence, QAction, QPen, QFontMetricsF,
+)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QScrollArea, QWidget, QToolBar,
     QFileDialog, QLabel, QInputDialog, QStatusBar, QPushButton,
@@ -24,13 +27,24 @@ FONTS = {
     "DejaVu Sans Mono": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
 }
 
+HANDLE_SIZE = 8  # pixels for resize handles
+
 
 class PdfCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.main_window = parent
         self.base_pixmap = QPixmap()
-        self._font_path_to_family = {}  # maps font file path -> Qt family name
+        self._font_path_to_family = {}
+
+        # Selection and drag state
+        self.selected_index = -1  # index into doc.pending_annotations(), -1 = none
+        self.dragging = False
+        self.drag_offset = QPointF(0, 0)  # offset from annotation origin to click point
+        self.resizing = False
+        self.resize_handle = None  # which handle is being dragged
+
+        self.setMouseTracking(True)
 
     def set_page(self, png_bytes: bytes):
         self.base_pixmap = QPixmap()
@@ -50,27 +64,92 @@ class PdfCanvas(QWidget):
     def qt_family_for(self, font_path: str) -> str:
         return self._font_path_to_family.get(font_path, "Liberation Sans")
 
+    def _ann_bbox_screen(self, ann, zoom):
+        """Return screen-space bounding rect for an annotation."""
+        sx = ann.x * zoom
+        sy = ann.y * zoom
+        if ann.type == "text":
+            font_family = self.qt_family_for(ann.font_path)
+            font = QFont(font_family)
+            font.setPixelSize(max(1, int(ann.font_size * zoom)))
+            fm = QFontMetricsF(font)
+            br = fm.boundingRect(ann.text)
+            # drawText uses baseline at (sx, sy), so text extends upward
+            return QRectF(sx + br.x(), sy + br.y(), br.width(), br.height())
+        elif ann.type == "image":
+            return QRectF(sx, sy, ann.width * zoom, ann.height * zoom)
+        return QRectF()
+
+    def _get_resize_handles(self, rect):
+        """Return dict of handle_name -> QRectF for an image bounding rect."""
+        hs = HANDLE_SIZE
+        hh = hs / 2
+        cx, cy = rect.center().x(), rect.center().y()
+        return {
+            "tl": QRectF(rect.left() - hh, rect.top() - hh, hs, hs),
+            "tr": QRectF(rect.right() - hh, rect.top() - hh, hs, hs),
+            "bl": QRectF(rect.left() - hh, rect.bottom() - hh, hs, hs),
+            "br": QRectF(rect.right() - hh, rect.bottom() - hh, hs, hs),
+            "t": QRectF(cx - hh, rect.top() - hh, hs, hs),
+            "b": QRectF(cx - hh, rect.bottom() - hh, hs, hs),
+            "l": QRectF(rect.left() - hh, cy - hh, hs, hs),
+            "r": QRectF(rect.right() - hh, cy - hh, hs, hs),
+        }
+
+    def _hit_test(self, pos):
+        """Return (annotation_index, handle_name_or_None) for click position.
+        Returns (-1, None) if nothing hit. Checks current page only."""
+        mw = self.main_window
+        if mw.doc is None:
+            return -1, None
+
+        zoom = mw.zoom
+        anns = mw.doc.pending_annotations()
+
+        # First check resize handles on selected annotation
+        if self.selected_index >= 0 and self.selected_index < len(anns):
+            sel = anns[self.selected_index]
+            if sel.page_num == mw.current_page and sel.type == "image":
+                bbox = self._ann_bbox_screen(sel, zoom)
+                handles = self._get_resize_handles(bbox)
+                for name, hrect in handles.items():
+                    if hrect.contains(pos):
+                        return self.selected_index, name
+
+        # Then check annotations (reverse order so topmost is hit first)
+        for i in range(len(anns) - 1, -1, -1):
+            ann = anns[i]
+            if ann.page_num != mw.current_page:
+                continue
+            bbox = self._ann_bbox_screen(ann, zoom)
+            if bbox.contains(pos):
+                return i, None
+
+        return -1, None
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self.base_pixmap)
 
-        doc = self.main_window.doc
-        if doc is None:
+        mw = self.main_window
+        if mw.doc is None:
             painter.end()
             return
 
-        zoom = self.main_window.zoom
-        current_page = self.main_window.current_page
+        zoom = mw.zoom
+        current_page = mw.current_page
+        anns = mw.doc.pending_annotations()
 
-        for ann in doc.pending_annotations():
+        for i, ann in enumerate(anns):
             if ann.page_num != current_page:
                 continue
             sx = ann.x * zoom
             sy = ann.y * zoom
+
             if ann.type == "text":
                 font_family = self.qt_family_for(ann.font_path)
                 font = QFont(font_family)
-                font.setPixelSize(int(ann.font_size * zoom))
+                font.setPixelSize(max(1, int(ann.font_size * zoom)))
                 painter.setFont(font)
                 r, g, b = ann.color
                 painter.setPen(QColor(int(r * 255), int(g * 255), int(b * 255)))
@@ -79,6 +158,22 @@ class PdfCanvas(QWidget):
                 pixmap = QPixmap(ann.image_path)
                 target = QRectF(sx, sy, ann.width * zoom, ann.height * zoom)
                 painter.drawPixmap(target.toRect(), pixmap)
+
+            # Draw selection highlight
+            if i == self.selected_index:
+                bbox = self._ann_bbox_screen(ann, zoom)
+                pen = QPen(QColor(0, 120, 215), 2, Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(bbox.adjusted(-2, -2, 2, 2))
+
+                # Draw resize handles for images
+                if ann.type == "image":
+                    handles = self._get_resize_handles(bbox)
+                    painter.setPen(QPen(QColor(0, 120, 215), 1))
+                    painter.setBrush(QColor(255, 255, 255))
+                    for hrect in handles.values():
+                        painter.drawRect(hrect)
 
         painter.end()
 
@@ -93,11 +188,44 @@ class PdfCanvas(QWidget):
         pdf_x = pos.x() / mw.zoom
         pdf_y = pos.y() / mw.zoom
 
+        # Hit test existing annotations first
+        hit_idx, handle = self._hit_test(pos)
+
+        if handle is not None:
+            # Start resizing
+            self.selected_index = hit_idx
+            self.resizing = True
+            self.resize_handle = handle
+            self._resize_start_pos = pos
+            ann = mw.doc.pending_annotations()[hit_idx]
+            self._resize_start_w = ann.width
+            self._resize_start_h = ann.height
+            self._resize_start_x = ann.x
+            self._resize_start_y = ann.y
+            self.update()
+            return
+
+        if hit_idx >= 0:
+            # Select and start dragging
+            self.selected_index = hit_idx
+            self.dragging = True
+            ann = mw.doc.pending_annotations()[hit_idx]
+            self.drag_offset = QPointF(
+                pos.x() - ann.x * mw.zoom,
+                pos.y() - ann.y * mw.zoom,
+            )
+            self.update()
+            return
+
+        # Nothing hit — deselect and create new annotation
+        self.selected_index = -1
+
         if mw.mode == "text":
             text, ok = QInputDialog.getText(
                 self, "Add Text", "Text:", text=DEFAULT_TEXT,
             )
             if not ok or not text:
+                self.update()
                 return
             mw.doc.add_text(
                 mw.current_page, pdf_x, pdf_y,
@@ -112,6 +240,7 @@ class PdfCanvas(QWidget):
                     "Images (*.png *.gif *.jpg *.jpeg)",
                 )
                 if not path:
+                    self.update()
                     return
                 mw.image_path = path
                 mw.image_label.setText(path.split("/")[-1])
@@ -123,6 +252,82 @@ class PdfCanvas(QWidget):
 
         self.update()
         mw.update_status()
+
+    def mouseMoveEvent(self, event):
+        mw = self.main_window
+        if mw.doc is None:
+            return
+
+        pos = event.position()
+
+        if self.dragging and self.selected_index >= 0:
+            new_x = (pos.x() - self.drag_offset.x()) / mw.zoom
+            new_y = (pos.y() - self.drag_offset.y()) / mw.zoom
+            mw.doc.update_annotation(self.selected_index, x=new_x, y=new_y)
+            self.update()
+            return
+
+        if self.resizing and self.selected_index >= 0:
+            dx = (pos.x() - self._resize_start_pos.x()) / mw.zoom
+            dy = (pos.y() - self._resize_start_pos.y()) / mw.zoom
+            h = self.resize_handle
+            new_w = self._resize_start_w
+            new_h = self._resize_start_h
+            new_x = self._resize_start_x
+            new_y = self._resize_start_y
+
+            if "r" in h:
+                new_w = max(10, self._resize_start_w + dx)
+            if "l" in h:
+                new_w = max(10, self._resize_start_w - dx)
+                new_x = self._resize_start_x + (self._resize_start_w - new_w)
+            if "b" in h:
+                new_h = max(10, self._resize_start_h + dy)
+            if "t" in h:
+                new_h = max(10, self._resize_start_h - dy)
+                new_y = self._resize_start_y + (self._resize_start_h - new_h)
+
+            mw.doc.update_annotation(
+                self.selected_index,
+                x=new_x, y=new_y, width=new_w, height=new_h,
+            )
+            self.update()
+            return
+
+        # Update cursor based on what's under the mouse
+        hit_idx, handle = self._hit_test(pos)
+        if handle in ("tl", "br"):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif handle in ("tr", "bl"):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif handle in ("t", "b"):
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif handle in ("l", "r"):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif hit_idx >= 0:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = False
+            self.resizing = False
+            self.resize_handle = None
+
+    def keyPressEvent(self, event):
+        mw = self.main_window
+        if event.key() == Qt.Key.Key_Escape:
+            self.selected_index = -1
+            self.update()
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.selected_index >= 0 and mw.doc:
+                mw.doc.remove_annotation(self.selected_index)
+                self.selected_index = -1
+                self.update()
+                mw.update_status()
+        else:
+            super().keyPressEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -139,6 +344,7 @@ class MainWindow(QMainWindow):
 
         # Canvas in scroll area
         self.canvas = PdfCanvas(self)
+        self.canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # Register all fonts for preview
         for font_path in FONTS.values():
             self.canvas.register_font(font_path)
@@ -248,6 +454,7 @@ class MainWindow(QMainWindow):
             return
         self.doc = PdfDocument(path)
         self.current_page = 0
+        self.canvas.selected_index = -1
         self.setWindowTitle(f"PDF Sign — {path}")
         self.refresh_page()
 
@@ -260,6 +467,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.doc.save(path)
+        self.statusBar().showMessage(f"Saved to {path}")
 
     def set_mode(self, mode):
         self.mode = mode
@@ -288,6 +496,7 @@ class MainWindow(QMainWindow):
 
     def undo(self):
         if self.doc and self.doc.undo():
+            self.canvas.selected_index = -1
             self.canvas.update()
             self.update_status()
 
@@ -301,17 +510,20 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.doc.clear()
+            self.canvas.selected_index = -1
             self.canvas.update()
             self.update_status()
 
     def prev_page(self):
         if self.doc and self.current_page > 0:
             self.current_page -= 1
+            self.canvas.selected_index = -1
             self.refresh_page()
 
     def next_page(self):
         if self.doc and self.current_page < self.doc.page_count() - 1:
             self.current_page += 1
+            self.canvas.selected_index = -1
             self.refresh_page()
 
     def refresh_page(self):
@@ -326,7 +538,10 @@ class MainWindow(QMainWindow):
         if self.doc is None:
             return
         n = len(self.doc.pending_annotations())
-        self.statusBar().showMessage(f"{n} annotation(s) pending")
+        sel = ""
+        if self.canvas.selected_index >= 0:
+            sel = f" | Selected: #{self.canvas.selected_index + 1}"
+        self.statusBar().showMessage(f"{n} annotation(s) pending{sel}")
 
 
 def main():

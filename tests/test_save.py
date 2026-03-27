@@ -32,6 +32,65 @@ class TestUndoClear:
         assert len(doc.pending_annotations()) == 0
 
 
+class TestUpdateAnnotation:
+    def test_update_position(self, simple_pdf, default_font):
+        doc = PdfDocument(simple_pdf)
+        doc.add_text(0, 72, 72, "Hello", default_font)
+        doc.update_annotation(0, x=200, y=300)
+        ann = doc.pending_annotations()[0]
+        assert ann.x == 200
+        assert ann.y == 300
+
+    def test_update_image_size(self, simple_pdf, signature_png):
+        doc = PdfDocument(simple_pdf)
+        doc.add_image(0, 72, 400, signature_png, 150, 50)
+        doc.update_annotation(0, width=200, height=80)
+        ann = doc.pending_annotations()[0]
+        assert ann.width == 200
+        assert ann.height == 80
+
+    def test_update_preserves_other_fields(self, simple_pdf, default_font):
+        doc = PdfDocument(simple_pdf)
+        doc.add_text(0, 72, 72, "Hello", default_font, font_size=14, color=(1, 0, 0))
+        doc.update_annotation(0, x=200)
+        ann = doc.pending_annotations()[0]
+        assert ann.x == 200
+        assert ann.y == 72  # unchanged
+        assert ann.text == "Hello"
+        assert ann.font_size == 14
+        assert ann.color == (1, 0, 0)
+
+    def test_update_invalid_index_raises(self, simple_pdf):
+        doc = PdfDocument(simple_pdf)
+        with pytest.raises(IndexError):
+            doc.update_annotation(5, x=100)
+
+    def test_update_saved_correctly(self, simple_pdf, default_font, tmp_output):
+        doc = PdfDocument(simple_pdf)
+        doc.add_text(0, 72, 72, "Moved", default_font)
+        doc.update_annotation(0, x=300, y=500)
+        doc.save(tmp_output)
+        result = fitz.open(tmp_output)
+        assert "Moved" in result[0].get_text()
+        result.close()
+
+    def test_remove_annotation(self, simple_pdf, default_font):
+        doc = PdfDocument(simple_pdf)
+        doc.add_text(0, 72, 72, "First", default_font)
+        doc.add_text(0, 72, 150, "Second", default_font)
+        doc.add_text(0, 72, 200, "Third", default_font)
+        doc.remove_annotation(1)
+        anns = doc.pending_annotations()
+        assert len(anns) == 2
+        assert anns[0].text == "First"
+        assert anns[1].text == "Third"
+
+    def test_remove_invalid_index_raises(self, simple_pdf):
+        doc = PdfDocument(simple_pdf)
+        with pytest.raises(IndexError):
+            doc.remove_annotation(0)
+
+
 class TestSaveEdgeCases:
     def test_save_without_annotations(self, simple_pdf, tmp_output):
         doc = PdfDocument(simple_pdf)

@@ -71,6 +71,20 @@ class PdfDocument:
     def pending_annotations(self) -> list[Annotation]:
         return list(self._annotations)
 
+    def update_annotation(self, index: int, **kwargs):
+        if index < 0 or index >= len(self._annotations):
+            raise IndexError(f"Annotation {index} out of range (0-{len(self._annotations) - 1})")
+        ann = self._annotations[index]
+        for key, value in kwargs.items():
+            if not hasattr(ann, key):
+                raise AttributeError(f"Annotation has no field '{key}'")
+            setattr(ann, key, value)
+
+    def remove_annotation(self, index: int):
+        if index < 0 or index >= len(self._annotations):
+            raise IndexError(f"Annotation {index} out of range (0-{len(self._annotations) - 1})")
+        self._annotations.pop(index)
+
     def undo(self) -> bool:
         if self._annotations:
             self._annotations.pop()
