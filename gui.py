@@ -16,7 +16,8 @@ from PyQt6.QtWidgets import (
 from pdfsign.core import PdfDocument
 
 DEFAULT_TEXT = f"Signed {date.today()}"
-ZOOM = 1.5
+DEFAULT_ZOOM = 1.5
+ZOOM_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
 FONTS = {
     "Liberation Sans": "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -336,7 +337,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PDF Sign")
         self.doc = None
         self.current_page = 0
-        self.zoom = ZOOM
+        self.zoom = DEFAULT_ZOOM
         self.mode = "text"
         self.image_path = ""
 
@@ -374,6 +375,20 @@ class MainWindow(QMainWindow):
         self.btn_next.setFixedWidth(30)
         self.btn_next.clicked.connect(self.next_page)
         toolbar.addWidget(self.btn_next)
+
+        toolbar.addSeparator()
+        self.btn_zoom_out = QPushButton("-")
+        self.btn_zoom_out.setFixedWidth(30)
+        self.btn_zoom_out.clicked.connect(self.zoom_out)
+        toolbar.addWidget(self.btn_zoom_out)
+
+        self.zoom_label = QLabel(f" {int(self.zoom * 100)}% ")
+        toolbar.addWidget(self.zoom_label)
+
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setFixedWidth(30)
+        self.btn_zoom_in.clicked.connect(self.zoom_in)
+        toolbar.addWidget(self.btn_zoom_in)
 
         toolbar.addSeparator()
         undo_action = QAction("Undo", self)
@@ -437,6 +452,27 @@ class MainWindow(QMainWindow):
         text_toolbar.addWidget(self.color_btn)
         text_toolbar.addWidget(QLabel(" Color"))
 
+        # Keyboard shortcuts
+        open_action = QAction("Open", self)
+        open_action.setShortcut(QKeySequence.StandardKey.Open)
+        open_action.triggered.connect(self.open_file)
+        self.addAction(open_action)
+
+        save_action = QAction("Save", self)
+        save_action.setShortcut(QKeySequence.StandardKey.Save)
+        save_action.triggered.connect(self.save_file)
+        self.addAction(save_action)
+
+        prev_action = QAction("Prev Page", self)
+        prev_action.setShortcut(QKeySequence(Qt.Key.Key_Left))
+        prev_action.triggered.connect(self.prev_page)
+        self.addAction(prev_action)
+
+        next_action = QAction("Next Page", self)
+        next_action.setShortcut(QKeySequence(Qt.Key.Key_Right))
+        next_action.triggered.connect(self.next_page)
+        self.addAction(next_action)
+
         # Status bar
         self.statusBar().showMessage("Open a PDF to begin")
 
@@ -493,6 +529,22 @@ class MainWindow(QMainWindow):
             self.image_path = path
             self.image_label.setText(path.split("/")[-1])
             self.radio_image.setChecked(True)
+
+    def zoom_in(self):
+        idx = ZOOM_LEVELS.index(self.zoom) if self.zoom in ZOOM_LEVELS else 0
+        if idx < len(ZOOM_LEVELS) - 1:
+            self.zoom = ZOOM_LEVELS[idx + 1]
+            self.zoom_label.setText(f" {int(self.zoom * 100)}% ")
+            self.canvas.selected_index = -1
+            self.refresh_page()
+
+    def zoom_out(self):
+        idx = ZOOM_LEVELS.index(self.zoom) if self.zoom in ZOOM_LEVELS else 0
+        if idx > 0:
+            self.zoom = ZOOM_LEVELS[idx - 1]
+            self.zoom_label.setText(f" {int(self.zoom * 100)}% ")
+            self.canvas.selected_index = -1
+            self.refresh_page()
 
     def undo(self):
         if self.doc and self.doc.undo():
