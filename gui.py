@@ -2,7 +2,7 @@ import os
 import sys
 from datetime import date
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSettings
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSettings, QEvent
 from PyQt6.QtGui import (
     QPixmap, QPainter, QFont, QColor, QFontDatabase,
     QKeySequence, QAction, QPen, QFontMetricsF,
@@ -31,6 +31,8 @@ FONTS = {
 }
 
 HANDLE_SIZE = 8  # pixels for resize handles
+PAGE_TURN_ZONE = 80  # pixels for scroll-to-turn zone below/above page
+PAGE_TURN_TICKS = 8  # number of scroll ticks to trigger page turn
 MAX_RECENT_TEXTS = 10
 DEFAULT_RECENT_TEXTS = ["Signed {date}", "{name}", "{name} - {date}", "{date}"]
 
@@ -72,12 +74,27 @@ class PdfCanvas(QWidget):
         self.resizing = False
         self.resize_handle = None  # which handle is being dragged
 
+        # Page turn scroll gate
+        self.turn_progress = 0  # 0 to PAGE_TURN_TICKS
+        self.turn_direction = 0  # +1 = next, -1 = prev
+
         self.setMouseTracking(True)
 
     def set_page(self, png_bytes: bytes):
         self.base_pixmap = QPixmap()
         self.base_pixmap.loadFromData(png_bytes)
-        self.setFixedSize(self.base_pixmap.size())
+        self.turn_progress = 0
+        self.turn_direction = 0
+        # Add space below for page turn zone (and above if not first page)
+        mw = self.main_window
+        extra_bottom = PAGE_TURN_ZONE if (mw.doc and mw.current_page < mw.doc.page_count() - 1) else 0
+        extra_top = PAGE_TURN_ZONE if (mw.doc and mw.current_page > 0) else 0
+        self._page_y_offset = extra_top
+        from PyQt6.QtCore import QSize
+        self.setFixedSize(QSize(
+            self.base_pixmap.width(),
+            self.base_pixmap.height() + extra_top + extra_bottom,
+        ))
         self.update()
 
     def register_font(self, font_path: str):
@@ -132,6 +149,7 @@ class PdfCanvas(QWidget):
             return -1, None
 
         zoom = mw.zoom
+        offy = getattr(self, "_page_y_offset", 0)
         anns = mw.doc.pending_annotations()
 
         # First check resize handles on selected annotation
@@ -139,6 +157,7 @@ class PdfCanvas(QWidget):
             sel = anns[self.selected_index]
             if sel.page_num == mw.current_page and sel.type == "image":
                 bbox = self._ann_bbox_screen(sel, zoom)
+                bbox.translate(0, offy)
                 handles = self._get_resize_handles(bbox)
                 for name, hrect in handles.items():
                     if hrect.contains(pos):
@@ -150,6 +169,7 @@ class PdfCanvas(QWidget):
             if ann.page_num != mw.current_page:
                 continue
             bbox = self._ann_bbox_screen(ann, zoom)
+            bbox.translate(0, offy)
             if bbox.contains(pos):
                 return i, None
 
@@ -157,7 +177,13 @@ class PdfCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.drawPixmap(0, 0, self.base_pixmap)
+        offy = getattr(self, "_page_y_offset", 0)
+
+        # Fill background for turn zones
+        painter.fillRect(self.rect(), QColor(220, 220, 220))
+
+        # Draw the page
+        painter.drawPixmap(0, offy, self.base_pixmap)
 
         mw = self.main_window
         if mw.doc is None:
@@ -172,7 +198,7 @@ class PdfCanvas(QWidget):
             if ann.page_num != current_page:
                 continue
             sx = ann.x * zoom
-            sy = ann.y * zoom
+            sy = ann.y * zoom + offy
 
             if ann.type == "text":
                 font_family = self.qt_family_for(ann.font_path)
@@ -190,6 +216,7 @@ class PdfCanvas(QWidget):
             # Draw selection highlight
             if i == self.selected_index:
                 bbox = self._ann_bbox_screen(ann, zoom)
+                bbox.translate(0, offy)
                 pen = QPen(QColor(0, 120, 215), 2, Qt.PenStyle.DashLine)
                 painter.setPen(pen)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -203,7 +230,59 @@ class PdfCanvas(QWidget):
                     for hrect in handles.values():
                         painter.drawRect(hrect)
 
+        # Draw page turn zones
+        page_bottom = offy + self.base_pixmap.height()
+        w = self.base_pixmap.width()
+
+        # Bottom turn zone (next page)
+        if mw.doc and current_page < mw.doc.page_count() - 1:
+            self._draw_turn_zone(painter, page_bottom, w, +1)
+
+        # Top turn zone (prev page)
+        if mw.doc and current_page > 0:
+            self._draw_turn_zone(painter, 0, w, -1)
+
         painter.end()
+
+    def _draw_turn_zone(self, painter, y_start, width, direction):
+        """Draw the scroll-to-turn progress zone."""
+        zone = QRectF(0, y_start, width, PAGE_TURN_ZONE)
+        painter.fillRect(zone, QColor(230, 230, 230))
+
+        # Only show progress if actively scrolling in this direction
+        if self.turn_direction != direction or self.turn_progress <= 0:
+            # Draw hint text
+            painter.setPen(QColor(160, 160, 160))
+            font = QFont("Liberation Sans", 10)
+            painter.setFont(font)
+            arrow = "▼" if direction > 0 else "▲"
+            label = "next page" if direction > 0 else "previous page"
+            painter.drawText(zone, Qt.AlignmentFlag.AlignCenter, f"{arrow}  Scroll for {label}  {arrow}")
+            return
+
+        # Draw progress bar
+        progress = self.turn_progress / PAGE_TURN_TICKS
+        bar_margin = 40
+        bar_h = 12
+        bar_y = y_start + (PAGE_TURN_ZONE - bar_h) / 2
+        bar_bg = QRectF(bar_margin, bar_y, width - 2 * bar_margin, bar_h)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(200, 200, 200))
+        painter.drawRoundedRect(bar_bg, 6, 6)
+
+        bar_fill = QRectF(bar_margin, bar_y, (width - 2 * bar_margin) * progress, bar_h)
+        painter.setBrush(QColor(0, 120, 215))
+        painter.drawRoundedRect(bar_fill, 6, 6)
+
+        # Arrow text
+        painter.setPen(QColor(80, 80, 80))
+        font = QFont("Liberation Sans", 10)
+        painter.setFont(font)
+        arrow = "▼" if direction > 0 else "▲"
+        label = "next page" if direction > 0 else "previous page"
+        text_rect = QRectF(0, y_start, width, (PAGE_TURN_ZONE - bar_h) / 2) if direction > 0 else \
+                    QRectF(0, bar_y + bar_h, width, (PAGE_TURN_ZONE - bar_h) / 2)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, f"{arrow}  {label}  {arrow}")
 
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -213,8 +292,9 @@ class PdfCanvas(QWidget):
             return
 
         pos = event.position()
+        offy = getattr(self, "_page_y_offset", 0)
         pdf_x = pos.x() / mw.zoom
-        pdf_y = pos.y() / mw.zoom
+        pdf_y = (pos.y() - offy) / mw.zoom
 
         # Hit test existing annotations first
         hit_idx, handle = self._hit_test(pos)
@@ -240,7 +320,7 @@ class PdfCanvas(QWidget):
             ann = mw.doc.pending_annotations()[hit_idx]
             self.drag_offset = QPointF(
                 pos.x() - ann.x * mw.zoom,
-                pos.y() - ann.y * mw.zoom,
+                pos.y() - (ann.y * mw.zoom + offy),
             )
             self.update()
             return
@@ -292,8 +372,9 @@ class PdfCanvas(QWidget):
         pos = event.position()
 
         if self.dragging and self.selected_index >= 0:
+            offy = getattr(self, "_page_y_offset", 0)
             new_x = (pos.x() - self.drag_offset.x()) / mw.zoom
-            new_y = (pos.y() - self.drag_offset.y()) / mw.zoom
+            new_y = (pos.y() - self.drag_offset.y() - offy) / mw.zoom
             mw.doc.update_annotation(self.selected_index, x=new_x, y=new_y)
             self.update()
             return
@@ -410,10 +491,11 @@ class MainWindow(QMainWindow):
         # Register all fonts for preview
         for font_path in FONTS.values():
             self.canvas.register_font(font_path)
-        scroll = QScrollArea()
-        scroll.setWidget(self.canvas)
-        scroll.setWidgetResizable(False)
-        self.setCentralWidget(scroll)
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.canvas)
+        self.scroll.setWidgetResizable(False)
+        self.scroll.viewport().installEventFilter(self)
+        self.setCentralWidget(self.scroll)
 
         # Toolbar
         toolbar = QToolBar()
@@ -644,6 +726,50 @@ class MainWindow(QMainWindow):
         s.setValue("last_pdf_dir", getattr(self, "_last_pdf_dir", ""))
         recent = [self.recent_combo.itemText(i) for i in range(self.recent_combo.count())]
         s.setValue("recent_texts", recent[:MAX_RECENT_TEXTS])
+
+    def eventFilter(self, obj, event):
+        if obj == self.scroll.viewport() and event.type() == QEvent.Type.Wheel:
+            vbar = self.scroll.verticalScrollBar()
+            at_bottom = vbar.value() >= vbar.maximum()
+            at_top = vbar.value() <= vbar.minimum()
+            delta = event.angleDelta().y()  # negative = scroll down
+
+            if at_bottom and delta < 0 and self.doc and self.current_page < self.doc.page_count() - 1:
+                # Scrolling down past bottom
+                if self.canvas.turn_direction != 1:
+                    self.canvas.turn_direction = 1
+                    self.canvas.turn_progress = 0
+                self.canvas.turn_progress += 1
+                self.canvas.update()
+                if self.canvas.turn_progress >= PAGE_TURN_TICKS:
+                    self.next_page()
+                    # Scroll to top of new page
+                    self.scroll.verticalScrollBar().setValue(0)
+                return True  # consume the event
+
+            elif at_top and delta > 0 and self.doc and self.current_page > 0:
+                # Scrolling up past top
+                if self.canvas.turn_direction != -1:
+                    self.canvas.turn_direction = -1
+                    self.canvas.turn_progress = 0
+                self.canvas.turn_progress += 1
+                self.canvas.update()
+                if self.canvas.turn_progress >= PAGE_TURN_TICKS:
+                    self.prev_page()
+                    # Scroll to bottom of new page
+                    self.scroll.verticalScrollBar().setValue(
+                        self.scroll.verticalScrollBar().maximum()
+                    )
+                return True  # consume the event
+
+            else:
+                # Normal scroll — reset turn progress
+                if self.canvas.turn_progress > 0:
+                    self.canvas.turn_progress = 0
+                    self.canvas.turn_direction = 0
+                    self.canvas.update()
+
+        return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
         self.save_settings()
