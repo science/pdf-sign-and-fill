@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PDF Simple Signing
+Comment=Stamp text and images onto PDFs
+Exec=/home/steve/.local/bin/pdf-simple-signing
+Icon=/home/steve/.local/share/icons/pdf-simple-signing.svg
+Terminal=false
+Categories=Office;Graphics;
+Keywords=pdf;sign;stamp;signature;annotation;
+MimeType=application/pdf;

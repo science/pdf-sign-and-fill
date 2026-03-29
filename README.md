@@ -6,11 +6,20 @@ Unlike LibreOffice Draw, Okular, or Evince, this tool does **not** parse or re-r
 
 ## Installation
 
+Requires Python 3.10+ and a Linux desktop with PyQt6 support.
+
 ```bash
-pip install PyMuPDF PyQt6 pytest
+git clone https://github.com/science/pdf-simple-signing.git
+cd pdf-simple-signing
+./install.sh
 ```
 
-Requires Python 3.10+ and system fonts (Liberation Sans, DejaVu Sans families).
+This creates a virtual environment in `build/`, installs dependencies, symlinks the launcher to `~/.local/bin/pdf-simple-signing`, and installs a `.desktop` file so the app appears in your application menu under **Office**.
+
+To run from terminal after install:
+```bash
+pdf-simple-signing
+```
 
 ## GUI Usage
 
@@ -22,14 +31,15 @@ python gui.py
 - **Open / Save As** -- open a PDF, save flattened output (always Save As, never overwrites original)
 - **Page navigation** -- `< >` buttons or Left/Right arrow keys
 - **Zoom** -- 50% to 200% in discrete steps
-- **Undo / Clear All** -- Ctrl+Z to undo last annotation
+- **Undo / Clear All** -- Ctrl+Z undoes adds, deletes, repositions, and resizes
 - **Text / Image mode** -- radio buttons to select placement mode
-- **Image filename** -- click to quickly switch to image mode with the last-used signature
+- **W / H** -- image dimension spinboxes (auto-populated from per-image size memory)
 
 ### Toolbar (Row 2)
 - **Font** -- family, size, and color controls for text annotations
-- **Text template** -- dropdown of recently used texts with variable expansion
-- **Settings** -- configure your name for `{name}` variable
+- **Text template** -- dropdown of recently used texts with variable expansion (`{date}`, `{name}`)
+- **Image picker** -- dropdown with thumbnails of recently used images, delete button per entry
+- **Settings** -- configure name and date format (strftime with live preview)
 
 ### Placing Text
 1. Select **Text** mode (default)
@@ -39,10 +49,10 @@ python gui.py
 5. Edit if needed, press OK -- text appears at click position
 
 ### Placing Images (Signatures)
-1. Click the image filename in the toolbar (or select **Image** mode and **Choose...**)
-2. Set W/H dimensions in the spinboxes
+1. Select an image from the **Image:** dropdown (or choose "Choose file...")
+2. Adjust W/H dimensions if needed (remembered per image)
 3. Click on the PDF -- image is placed at that position
-4. Subsequent clicks reuse the same image
+4. Subsequent clicks reuse the same image and size
 
 ### Editing Annotations
 - **Select** -- click on an existing annotation (dashed blue border appears)
@@ -65,9 +75,10 @@ python gui.py
 ### Persistent Settings
 
 All settings are saved automatically on close and restored on next launch:
-- Last selected signature image and size
+- Recent images with per-image remembered dimensions
 - Font family, size, and color
 - Recently used text templates
+- Name and date format preferences
 - Window size and position
 - Zoom level
 - Last opened PDF directory
@@ -94,15 +105,25 @@ python -m pdfsign.cli add-image input.pdf output.pdf \
 python -m pdfsign.cli render input.pdf page0.png --page 0 --zoom 2.0
 ```
 
-## Running Tests
+## Development
 
 ```bash
+pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-## Architecture
+### Architecture
 
 - `pdfsign/core.py` -- Core API (`PdfDocument` class) with zero GUI dependencies
 - `pdfsign/cli.py` -- CLI interface consuming the core API
 - `gui.py` -- PyQt6 GUI consuming the same core API
-- `tests/` -- 36 tests covering open, text, image, save, undo, update, and remove
+- Command-pattern undo stack with `AddAction`, `RemoveAction`, `UpdateAction`, `ClearAction`
+- Dirty flag tracks undo stack depth vs. save point
+
+### Tests
+
+98 tests covering core API, GUI logic, undo stack, dirty flag, image picker, resize behavior, and settings persistence.
+
+## License
+
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0), as required by its dependency on [PyMuPDF](https://pymupdf.readthedocs.io/) which is AGPL-3.0 licensed.

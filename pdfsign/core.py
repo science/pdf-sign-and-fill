@@ -4,6 +4,29 @@ import os
 import fitz  # PyMuPDF
 
 
+# Undo action types
+@dataclass
+class AddAction:
+    index: int
+
+
+@dataclass
+class RemoveAction:
+    index: int
+    annotation: object  # Annotation
+
+
+@dataclass
+class UpdateAction:
+    index: int
+    old_values: dict
+
+
+@dataclass
+class ClearAction:
+    annotations: list
+
+
 @dataclass
 class Annotation:
     type: str  # "text" or "image"
@@ -28,6 +51,10 @@ class PdfDocument:
         self._path = path
         self._doc = fitz.open(path)
         self._annotations: list[Annotation] = []
+        self._undo_stack: list = []
+        self._saved_at_depth: int = 0
+        self._edit_snapshot: dict | None = None
+        self._edit_index: int | None = None
 
     def page_count(self) -> int:
         return len(self._doc)
@@ -56,6 +83,7 @@ class PdfDocument:
             type="text", page_num=page_num, x=x, y=y,
             text=text, font_path=font_path, font_size=font_size, color=color,
         ))
+        self._undo_stack.append(AddAction(len(self._annotations) - 1))
 
     def add_image(self, page_num: int, x: float, y: float,
                   image_path: str, width: float, height: float):
@@ -67,9 +95,32 @@ class PdfDocument:
             type="image", page_num=page_num, x=x, y=y,
             image_path=image_path, width=width, height=height,
         ))
+        self._undo_stack.append(AddAction(len(self._annotations) - 1))
 
     def pending_annotations(self) -> list[Annotation]:
         return list(self._annotations)
+
+    def begin_edit(self, index: int):
+        """Snapshot annotation state before a drag/resize series."""
+        if index < 0 or index >= len(self._annotations):
+            raise IndexError(f"Annotation {index} out of range (0-{len(self._annotations) - 1})")
+        # Auto-commit any uncommitted previous edit
+        if self._edit_snapshot is not None:
+            self.commit_edit()
+        self._edit_index = index
+        self._edit_snapshot = vars(self._annotations[index]).copy()
+
+    def commit_edit(self):
+        """Push an UpdateAction if the annotation changed since begin_edit."""
+        if self._edit_snapshot is None:
+            return
+        index = self._edit_index
+        ann = self._annotations[index]
+        current = vars(ann)
+        if current != self._edit_snapshot:
+            self._undo_stack.append(UpdateAction(index, self._edit_snapshot))
+        self._edit_snapshot = None
+        self._edit_index = None
 
     def update_annotation(self, index: int, **kwargs):
         if index < 0 or index >= len(self._annotations):
@@ -83,16 +134,36 @@ class PdfDocument:
     def remove_annotation(self, index: int):
         if index < 0 or index >= len(self._annotations):
             raise IndexError(f"Annotation {index} out of range (0-{len(self._annotations) - 1})")
-        self._annotations.pop(index)
+        annotation = self._annotations.pop(index)
+        self._undo_stack.append(RemoveAction(index, annotation))
 
     def undo(self) -> bool:
-        if self._annotations:
-            self._annotations.pop()
-            return True
-        return False
+        if not self._undo_stack:
+            return False
+        action = self._undo_stack.pop()
+        if isinstance(action, AddAction):
+            self._annotations.pop(action.index)
+        elif isinstance(action, RemoveAction):
+            self._annotations.insert(action.index, action.annotation)
+        elif isinstance(action, UpdateAction):
+            ann = self._annotations[action.index]
+            for key, value in action.old_values.items():
+                setattr(ann, key, value)
+        elif isinstance(action, ClearAction):
+            self._annotations = list(action.annotations)
+        return True
 
     def clear(self):
+        if self._annotations:
+            self._undo_stack.append(ClearAction(list(self._annotations)))
         self._annotations.clear()
+
+    @property
+    def is_dirty(self) -> bool:
+        return len(self._undo_stack) != self._saved_at_depth
+
+    def mark_saved(self):
+        self._saved_at_depth = len(self._undo_stack)
 
     def save(self, output_path: str):
         # Open a fresh copy so we don't mutate the in-memory doc

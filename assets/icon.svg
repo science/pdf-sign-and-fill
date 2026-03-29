@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- PDF document -->
+  <rect x="20" y="8" width="72" height="96" rx="4" fill="#ffffff" stroke="#4a5568" stroke-width="3"/>
+  <!-- Dog-ear fold -->
+  <path d="M72 8 L92 28 L72 28 Z" fill="#e2e8f0" stroke="#4a5568" stroke-width="2" stroke-linejoin="round"/>
+  <!-- Text lines -->
+  <rect x="32" y="40" width="40" height="4" rx="2" fill="#cbd5e0"/>
+  <rect x="32" y="50" width="48" height="4" rx="2" fill="#cbd5e0"/>
+  <rect x="32" y="60" width="36" height="4" rx="2" fill="#cbd5e0"/>
+  <!-- Signature stroke -->
+  <path d="M34 82 C40 72, 46 88, 54 76 C58 70, 64 84, 72 74 L76 72" fill="none" stroke="#3182ce" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Pen nib -->
+  <g transform="translate(86, 62) rotate(35)">
+    <rect x="-3" y="-28" width="6" height="24" rx="1.5" fill="#e53e3e"/>
+    <polygon points="-3,-4 3,-4 0,6" fill="#4a5568"/>
+    <rect x="-3" y="-28" width="6" height="5" rx="1.5" fill="#c53030"/>
+  </g>
+</svg>

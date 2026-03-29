@@ -1,8 +1,10 @@
+import json
+import locale
 import os
 import sys
 from datetime import date
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSettings, QEvent
+from PyQt6.QtCore import Qt, QRectF, QPointF, QSettings, QEvent, QSize
 from PyQt6.QtGui import (
     QPixmap, QPainter, QFont, QColor, QFontDatabase,
     QKeySequence, QAction, QPen, QFontMetricsF,
@@ -12,12 +14,24 @@ from PyQt6.QtWidgets import (
     QFileDialog, QLabel, QInputDialog, QStatusBar, QPushButton,
     QMessageBox, QRadioButton, QSpinBox,
     QComboBox, QColorDialog, QDialog, QFormLayout, QLineEdit,
-    QDialogButtonBox,
+    QDialogButtonBox, QGroupBox, QVBoxLayout, QHBoxLayout,
+    QStyledItemDelegate, QStyleOptionViewItem,
 )
 
 from pdfsign.core import PdfDocument
 
 DEFAULT_TEXT = f"Signed {date.today()}"
+
+def _system_date_format():
+    """Get the system locale's date format string, or a sensible default."""
+    try:
+        locale.setlocale(locale.LC_TIME, "")
+        fmt = locale.nl_langinfo(locale.D_FMT)
+        if fmt:
+            return fmt
+    except (locale.Error, AttributeError):
+        pass
+    return "%Y-%m-%d"
 DEFAULT_ZOOM = 1.5
 ZOOM_LEVELS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
 
@@ -34,30 +48,234 @@ HANDLE_SIZE = 8  # pixels for resize handles
 PAGE_TURN_ZONE = 80  # pixels for scroll-to-turn zone below/above page
 PAGE_TURN_TICKS = 8  # number of scroll ticks to trigger page turn
 MAX_RECENT_TEXTS = 10
+MAX_RECENT_IMAGES = 10
+THUMBNAIL_SIZE = 32
 DEFAULT_RECENT_TEXTS = ["Signed {date}", "{name}", "{name} - {date}", "{date}"]
 
 
 def expand_variables(template, settings_vars):
     """Expand {date}, {name} etc. in a template string."""
     result = template
-    result = result.replace("{date}", str(date.today()))
+    date_fmt = settings_vars.get("date_format", "%Y-%m-%d")
+    result = result.replace("{date}", date.today().strftime(date_fmt))
     result = result.replace("{name}", settings_vars.get("name", ""))
     return result
 
 
+COMMON_DATE_FORMATS = [
+    ("%Y-%m-%d", "2026-03-28"),
+    ("%m/%d/%Y", "03/28/2026"),
+    ("%d/%m/%Y", "28/03/2026"),
+    ("%B %d, %Y", "March 28, 2026"),
+    ("%b %d, %Y", "Mar 28, 2026"),
+    ("%d %B %Y", "28 March 2026"),
+    ("%d %b %Y", "28 Mar 2026"),
+    ("%m-%d-%Y", "03-28-2026"),
+    ("%d.%m.%Y", "28.03.2026"),
+]
+
+DATE_FORMAT_GUIDE = (
+    "<b>Common format codes:</b><br>"
+    "<table cellpadding='2'>"
+    "<tr><td><code>%Y</code></td><td>4-digit year (2026)</td></tr>"
+    "<tr><td><code>%y</code></td><td>2-digit year (26)</td></tr>"
+    "<tr><td><code>%m</code></td><td>Month number, zero-padded (03)</td></tr>"
+    "<tr><td><code>%d</code></td><td>Day, zero-padded (28)</td></tr>"
+    "<tr><td><code>%B</code></td><td>Full month name (March)</td></tr>"
+    "<tr><td><code>%b</code></td><td>Abbreviated month (Mar)</td></tr>"
+    "<tr><td><code>%A</code></td><td>Full weekday name (Saturday)</td></tr>"
+    "<tr><td><code>%a</code></td><td>Abbreviated weekday (Sat)</td></tr>"
+    "</table><br>"
+    "Full reference: "
+    "<a href='https://strftime.org/'>https://strftime.org/</a>"
+)
+
+
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, current_name=""):
+    def __init__(self, parent=None, current_name="", current_date_format=""):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        layout = QFormLayout(self)
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+
+        # Name field
+        name_group = QGroupBox("Name")
+        name_layout = QFormLayout()
         self.name_edit = QLineEdit(current_name)
-        layout.addRow("Name:", self.name_edit)
+        name_layout.addRow("Your name:", self.name_edit)
+        name_group.setLayout(name_layout)
+        layout.addWidget(name_group)
+
+        # Date format field
+        date_group = QGroupBox("Date Format")
+        date_layout = QVBoxLayout()
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Format:"))
+        self.date_combo = QComboBox()
+        self.date_combo.setEditable(True)
+        self.date_combo.setMinimumWidth(200)
+        # Populate with common formats showing preview
+        for fmt, example in COMMON_DATE_FORMATS:
+            self.date_combo.addItem(f"{fmt}  →  {example}", fmt)
+        # Set current value
+        if current_date_format:
+            idx = self.date_combo.findData(current_date_format)
+            if idx >= 0:
+                self.date_combo.setCurrentIndex(idx)
+            else:
+                # Custom format not in presets — show it raw
+                self.date_combo.setEditText(current_date_format)
+        fmt_row.addWidget(self.date_combo)
+        date_layout.addLayout(fmt_row)
+
+        # Live preview
+        preview_row = QHBoxLayout()
+        preview_row.addWidget(QLabel("Preview:"))
+        self.date_preview = QLabel()
+        self.date_preview.setStyleSheet("font-weight: bold;")
+        preview_row.addWidget(self.date_preview)
+        preview_row.addStretch()
+        date_layout.addLayout(preview_row)
+
+        # Guide
+        guide_label = QLabel(DATE_FORMAT_GUIDE)
+        guide_label.setOpenExternalLinks(True)
+        guide_label.setWordWrap(True)
+        date_layout.addWidget(guide_label)
+
+        date_group.setLayout(date_layout)
+        layout.addWidget(date_group)
+
+        # Buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
+        layout.addWidget(buttons)
+
+        # Wire up live preview
+        self.date_combo.currentIndexChanged.connect(self._update_preview)
+        self.date_combo.currentTextChanged.connect(self._update_preview)
+        self._update_preview()
+
+    def _update_preview(self):
+        fmt = self.get_date_format()
+        try:
+            preview = date.today().strftime(fmt)
+        except (ValueError, TypeError):
+            preview = "(invalid format)"
+        self.date_preview.setText(preview)
+
+    def get_date_format(self):
+        """Return the raw strftime format string (not the display text with arrow)."""
+        # If a preset is selected, use its data
+        data = self.date_combo.currentData()
+        if data:
+            return data
+        # Otherwise parse custom text — strip any "→ example" portion
+        text = self.date_combo.currentText().strip()
+        if "→" in text:
+            text = text.split("→")[0].strip()
+        return text if text else "%Y-%m-%d"
+
+
+class ImageItemDelegate(QStyledItemDelegate):
+    """Custom delegate for image combo: thumbnail + filename + delete button."""
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self._thumb_cache = {}
+
+    def _get_thumbnail(self, path):
+        if path not in self._thumb_cache:
+            pm = QPixmap(path)
+            if pm.isNull():
+                pm = QPixmap(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+                pm.fill(QColor(200, 200, 200))
+            else:
+                pm = pm.scaled(
+                    THUMBNAIL_SIZE, THUMBNAIL_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self._thumb_cache[path] = pm
+        return self._thumb_cache[path]
+
+    def invalidate_thumbnail(self, path):
+        self._thumb_cache.pop(path, None)
+
+    def sizeHint(self, option, index):
+        if index.row() == 0:
+            return super().sizeHint(option, index)
+        return QSize(option.rect.width(), THUMBNAIL_SIZE + 8)
+
+    def paint(self, painter, option, index):
+        # Draw background (selection/hover highlight)
+        style = option.widget.style() if option.widget else None
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        if style:
+            style.drawPrimitive(style.PrimitiveElement.PE_PanelItemViewItem, opt, painter, option.widget)
+
+        if index.row() == 0:
+            # "Choose file..." — draw as plain text
+            painter.setPen(option.palette.color(option.palette.ColorRole.Text))
+            text_rect = option.rect.adjusted(6, 0, 0, 0)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, "Choose file...")
+            return
+
+        path = index.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            super().paint(painter, option, index)
+            return
+
+        rect = option.rect
+        margin = 4
+
+        # Thumbnail
+        thumb = self._get_thumbnail(path)
+        thumb_x = rect.left() + margin
+        thumb_y = rect.top() + (rect.height() - thumb.height()) // 2
+        painter.drawPixmap(thumb_x, thumb_y, thumb)
+
+        # Filename
+        text_x = thumb_x + THUMBNAIL_SIZE + margin * 2
+        filename = os.path.basename(path)
+        painter.setPen(option.palette.color(option.palette.ColorRole.Text))
+        painter.drawText(
+            text_x, rect.top(), rect.width() - text_x - 28, rect.height(),
+            Qt.AlignmentFlag.AlignVCenter, filename,
+        )
+
+        # Delete X button
+        x_rect = self._x_button_rect(rect)
+        painter.setPen(QColor(150, 150, 150))
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(x_rect, Qt.AlignmentFlag.AlignCenter, "✕")
+
+    def _x_button_rect(self, item_rect):
+        return QRectF(
+            item_rect.right() - 24,
+            item_rect.top() + (item_rect.height() - 16) / 2,
+            20, 16,
+        )
+
+    def editorEvent(self, event, model, option, index):
+        if index.row() == 0:
+            return False
+        if event.type() == QEvent.Type.MouseButtonRelease:
+            x_rect = self._x_button_rect(option.rect)
+            if x_rect.contains(event.position()):
+                path = index.data(Qt.ItemDataRole.UserRole)
+                if path:
+                    self.main_window.remove_recent_image(path)
+                return True
+        return False
 
 
 class PdfCanvas(QWidget):
@@ -310,6 +528,7 @@ class PdfCanvas(QWidget):
             self._resize_start_h = ann.height
             self._resize_start_x = ann.x
             self._resize_start_y = ann.y
+            mw.doc.begin_edit(hit_idx)
             self.update()
             return
 
@@ -322,6 +541,7 @@ class PdfCanvas(QWidget):
                 pos.x() - ann.x * mw.zoom,
                 pos.y() - (ann.y * mw.zoom + offy),
             )
+            mw.doc.begin_edit(hit_idx)
             self.update()
             return
 
@@ -354,11 +574,11 @@ class PdfCanvas(QWidget):
                     self.update()
                     return
                 mw.image_path = path
-                mw.image_label.setText(path.split("/")[-1])
+                mw._add_recent_image(path)
+            w, h = mw.get_image_size(mw.image_path)
             mw.doc.add_image(
                 mw.current_page, pdf_x, pdf_y,
-                mw.image_path,
-                mw.img_width.value(), mw.img_height.value(),
+                mw.image_path, w, h,
             )
 
         self.update()
@@ -406,11 +626,12 @@ class PdfCanvas(QWidget):
                 else:
                     d_vert = 0
                 # Use whichever delta is larger in magnitude
+                # d and d_vert are already normalized to "outward" direction
                 if abs(d) >= abs(d_vert):
-                    new_w = max(10, self._resize_start_w + (d if "r" in h else -d))
+                    new_w = max(10, self._resize_start_w + d)
                     new_h = max(10, new_w / aspect)
                 else:
-                    new_h = max(10, self._resize_start_h + (d_vert if "b" in h else -d_vert))
+                    new_h = max(10, self._resize_start_h + d_vert)
                     new_w = max(10, new_h * aspect)
                 # Anchor the opposite corner
                 if "l" in h:
@@ -454,9 +675,23 @@ class PdfCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            was_dragging = self.dragging
+            was_resizing = self.resizing
             self.dragging = False
             self.resizing = False
             self.resize_handle = None
+
+            mw = self.main_window
+            if (was_dragging or was_resizing) and mw.doc:
+                mw.doc.commit_edit()
+
+            if was_resizing and self.selected_index >= 0:
+                if mw.doc:
+                    anns = mw.doc.pending_annotations()
+                    if self.selected_index < len(anns):
+                        ann = anns[self.selected_index]
+                        if ann.type == "image":
+                            mw.remember_image_size(ann.image_path, ann.width, ann.height)
 
     def keyPressEvent(self, event):
         mw = self.main_window
@@ -482,6 +717,9 @@ class MainWindow(QMainWindow):
         self.zoom = DEFAULT_ZOOM
         self.mode = "text"
         self.image_path = ""
+        self.image_sizes = {}       # {path: [w, h]} — per-image remembered sizes
+        self.recent_images = []     # ordered list of recent image paths
+        self._updating_spinboxes = False
 
         self.text_color = (0.0, 0.0, 0.0)
 
@@ -551,18 +789,7 @@ class MainWindow(QMainWindow):
         self.radio_image.toggled.connect(lambda checked: self.set_mode("image") if checked else None)
         toolbar.addWidget(self.radio_image)
 
-        # Image controls
-        self.image_label = QPushButton("No image")
-        self.image_label.setFlat(True)
-        self.image_label.setStyleSheet(
-            "QPushButton { text-decoration: underline; color: palette(link); }"
-            "QPushButton:hover { color: palette(highlight); }"
-        )
-        self.image_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.image_label.clicked.connect(self.quick_image_mode)
-        toolbar.addWidget(self.image_label)
-        toolbar.addAction("Choose...", self.choose_image)
-
+        # Image size controls (image selection moved to Row 2 combo)
         lbl_w = QLabel(" W:")
         toolbar.addWidget(lbl_w)
         self.img_width = QSpinBox()
@@ -576,6 +803,9 @@ class MainWindow(QMainWindow):
         self.img_height.setRange(10, 600)
         self.img_height.setValue(50)
         toolbar.addWidget(self.img_height)
+
+        self.img_width.valueChanged.connect(self._on_size_spinbox_changed)
+        self.img_height.valueChanged.connect(self._on_size_spinbox_changed)
 
         # Text controls toolbar (second row)
         text_toolbar = QToolBar("Text Controls")
@@ -609,6 +839,16 @@ class MainWindow(QMainWindow):
         self.recent_combo.setMinimumWidth(200)
         self.recent_combo.addItems(DEFAULT_RECENT_TEXTS)
         text_toolbar.addWidget(self.recent_combo)
+
+        text_toolbar.addSeparator()
+        text_toolbar.addWidget(QLabel(" Image: "))
+        self.image_combo = QComboBox()
+        self.image_combo.setMinimumWidth(200)
+        self._image_delegate = ImageItemDelegate(self, self.image_combo)
+        self.image_combo.setItemDelegate(self._image_delegate)
+        self.image_combo.addItem("Choose file...")
+        self.image_combo.activated.connect(self._on_image_combo_activated)
+        text_toolbar.addWidget(self.image_combo)
 
         text_toolbar.addAction("Settings...", self.open_settings)
 
@@ -648,10 +888,84 @@ class MainWindow(QMainWindow):
     def _settings_vars(self):
         """Return dict of variable values for template expansion."""
         s = QSettings("PDF Simple Signing", "PDF Simple Signing")
-        return {"name": s.value("user_name", "")}
+        return {
+            "name": s.value("user_name", ""),
+            "date_format": s.value("date_format", _system_date_format()),
+        }
 
     def _expand_text(self, template):
         return expand_variables(template, self._settings_vars())
+
+    def remember_image_size(self, path, width, height):
+        """Store per-image dimensions. Update spinboxes if this is the current image."""
+        self.image_sizes[path] = [width, height]
+        if path == self.image_path:
+            self._updating_spinboxes = True
+            self.img_width.setValue(int(width))
+            self.img_height.setValue(int(height))
+            self._updating_spinboxes = False
+
+    def get_image_size(self, path):
+        """Return remembered (w, h) for path, or fall back to spinbox values."""
+        if path in self.image_sizes:
+            w, h = self.image_sizes[path]
+            return (w, h)
+        return (self.img_width.value(), self.img_height.value())
+
+    def _add_recent_image(self, path):
+        """Add image path to recent list (front, dedup, capped)."""
+        if path in self.recent_images:
+            self.recent_images.remove(path)
+        self.recent_images.insert(0, path)
+        self.recent_images = self.recent_images[:MAX_RECENT_IMAGES]
+        if hasattr(self, "image_combo"):
+            self._rebuild_image_combo()
+
+    def remove_recent_image(self, path):
+        """Remove image from recent list and size memory."""
+        if path in self.recent_images:
+            self.recent_images.remove(path)
+        self.image_sizes.pop(path, None)
+        if self.image_path == path:
+            self.image_path = ""
+        if hasattr(self, "image_combo"):
+            self._rebuild_image_combo()
+
+    def _rebuild_image_combo(self):
+        """Rebuild image combo from recent_images list."""
+        if not hasattr(self, "image_combo"):
+            return
+        self.image_combo.clear()
+        self.image_combo.addItem("Choose file...")
+        for path in self.recent_images:
+            self.image_combo.addItem(os.path.basename(path))
+            self.image_combo.setItemData(
+                self.image_combo.count() - 1, path, Qt.ItemDataRole.UserRole
+            )
+
+    def _on_image_combo_activated(self, index):
+        """Handle image combo selection."""
+        if index == 0:
+            self.choose_image()
+            return
+        path = self.image_combo.itemData(index, Qt.ItemDataRole.UserRole)
+        if path:
+            self.image_path = path
+            w, h = self.get_image_size(path)
+            self._updating_spinboxes = True
+            self.img_width.setValue(int(w))
+            self.img_height.setValue(int(h))
+            self._updating_spinboxes = False
+            self.radio_image.setChecked(True)
+
+    def _on_size_spinbox_changed(self):
+        """When spinboxes change manually, update per-image memory."""
+        if self._updating_spinboxes:
+            return
+        if self.image_path:
+            self.image_sizes[self.image_path] = [
+                self.img_width.value(), self.img_height.value()
+            ]
 
     def _add_recent_text(self, template):
         """Add template to recent list (at top, no duplicates)."""
@@ -667,9 +981,11 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         s = QSettings("PDF Simple Signing", "PDF Simple Signing")
         current_name = s.value("user_name", "")
-        dlg = SettingsDialog(self, current_name)
+        current_date_fmt = s.value("date_format", _system_date_format())
+        dlg = SettingsDialog(self, current_name, current_date_fmt)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             s.setValue("user_name", dlg.name_edit.text())
+            s.setValue("date_format", dlg.get_date_format())
 
     def load_settings(self):
         s = QSettings("PDF Simple Signing", "PDF Simple Signing")
@@ -677,14 +993,35 @@ class MainWindow(QMainWindow):
         geo = s.value("geometry")
         if geo:
             self.restoreGeometry(geo)
-        # Image path
+        # Recent images list
+        raw = s.value("recent_images", "[]")
+        try:
+            self.recent_images = json.loads(raw) if isinstance(raw, str) else []
+        except (json.JSONDecodeError, TypeError):
+            self.recent_images = []
+        self.recent_images = [p for p in self.recent_images if os.path.exists(p)]
+        # Per-image sizes
+        raw = s.value("image_sizes", "{}")
+        try:
+            self.image_sizes = json.loads(raw) if isinstance(raw, str) else {}
+        except (json.JSONDecodeError, TypeError):
+            self.image_sizes = {}
+        # Image path (backward compat)
         img = s.value("image_path", "")
         if img and os.path.exists(img):
             self.image_path = img
-            self.image_label.setText(img.split("/")[-1])
-        # Image size
-        self.img_width.setValue(int(s.value("img_width", 150)))
-        self.img_height.setValue(int(s.value("img_height", 50)))
+            if img not in self.recent_images:
+                self.recent_images.insert(0, img)
+        # Rebuild image combo
+        self._rebuild_image_combo()
+        # Image size — use per-image memory if available
+        if self.image_path and self.image_path in self.image_sizes:
+            w, h = self.image_sizes[self.image_path]
+            self.img_width.setValue(int(w))
+            self.img_height.setValue(int(h))
+        else:
+            self.img_width.setValue(int(s.value("img_width", 150)))
+            self.img_height.setValue(int(s.value("img_height", 50)))
         # Font
         font_name = s.value("font_name", "Liberation Sans")
         idx = self.font_combo.findText(font_name)
@@ -716,6 +1053,8 @@ class MainWindow(QMainWindow):
         s = QSettings("PDF Simple Signing", "PDF Simple Signing")
         s.setValue("geometry", self.saveGeometry())
         s.setValue("image_path", self.image_path)
+        s.setValue("recent_images", json.dumps(self.recent_images[:MAX_RECENT_IMAGES]))
+        s.setValue("image_sizes", json.dumps(self.image_sizes))
         s.setValue("img_width", self.img_width.value())
         s.setValue("img_height", self.img_height.value())
         s.setValue("font_name", self.font_combo.currentText())
@@ -772,10 +1111,29 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
+        if self.doc and self.doc.is_dirty:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved annotation changes. Close without saving?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         self.save_settings()
         super().closeEvent(event)
 
     def open_file(self):
+        if self.doc and self.doc.is_dirty:
+            reply = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved annotation changes. Open a new file without saving?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         start_dir = getattr(self, "_last_pdf_dir", "")
         path, _ = QFileDialog.getOpenFileName(
             self, "Open PDF", start_dir, "PDF Files (*.pdf)"
@@ -798,6 +1156,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.doc.save(path)
+        self.doc.mark_saved()
         self.statusBar().showMessage(f"Saved to {path}")
 
     def set_mode(self, mode):
@@ -815,12 +1174,6 @@ class MainWindow(QMainWindow):
         name = self.font_combo.currentText()
         return FONTS.get(name, list(FONTS.values())[0])
 
-    def quick_image_mode(self):
-        if self.image_path and os.path.exists(self.image_path):
-            self.radio_image.setChecked(True)
-        else:
-            self.choose_image()
-
     def choose_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose Image", "",
@@ -828,7 +1181,17 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.image_path = path
-            self.image_label.setText(path.split("/")[-1])
+            self._add_recent_image(path)
+            # Select the newly chosen image in the combo (index 1, after "Choose file...")
+            idx = self.image_combo.findData(path, Qt.ItemDataRole.UserRole)
+            if idx >= 0:
+                self.image_combo.setCurrentIndex(idx)
+            # Auto-populate spinboxes from per-image memory
+            w, h = self.get_image_size(path)
+            self._updating_spinboxes = True
+            self.img_width.setValue(int(w))
+            self.img_height.setValue(int(h))
+            self._updating_spinboxes = False
             self.radio_image.setChecked(True)
 
     def zoom_in(self):
