@@ -3,12 +3,19 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
-APP_NAME="pdf-simple-signing"
+APP_NAME="pdf-sign-and-fill"
 BIN_DIR="$HOME/.local/bin"
 ICON_DIR="$HOME/.local/share/icons"
 DESKTOP_DIR="$HOME/.local/share/applications"
 
 echo "=== Installing $APP_NAME ==="
+
+# Clean up legacy "pdf-simple-signing" install if present
+for legacy in pdf-simple-signing; do
+    rm -f "$BIN_DIR/$legacy" \
+          "$DESKTOP_DIR/$legacy.desktop" \
+          "$ICON_DIR/$legacy.svg"
+done
 
 # Create build directory with venv
 echo "Creating virtual environment..."
@@ -25,7 +32,14 @@ cp "$PROJECT_DIR/gui.py" "$BUILD_DIR/gui.py"
 # Create launcher script
 cat > "$BUILD_DIR/$APP_NAME" << 'LAUNCHER'
 #!/usr/bin/env bash
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks to find the real script location
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 exec "$SCRIPT_DIR/venv/bin/python3" "$SCRIPT_DIR/gui.py" "$@"
 LAUNCHER
 chmod +x "$BUILD_DIR/$APP_NAME"
@@ -53,4 +67,4 @@ fi
 echo ""
 echo "=== Installed successfully ==="
 echo "Run from terminal:  $APP_NAME"
-echo "Or find 'PDF Simple Signing' in your application menu (Office category)"
+echo "Or find 'PDF Sign & Fill' in your application menu (Office category)"

@@ -5,6 +5,12 @@ import pytest
 from pdfsign.core import PdfDocument
 
 
+class TestPathProperty:
+    def test_pdf_document_path_property(self, simple_pdf):
+        doc = PdfDocument(simple_pdf)
+        assert doc.path == simple_pdf
+
+
 class TestUndoClear:
     def test_undo_removes_last(self, simple_pdf, default_font):
         doc = PdfDocument(simple_pdf)

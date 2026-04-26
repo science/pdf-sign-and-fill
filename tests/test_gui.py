@@ -308,7 +308,7 @@ class TestSettingsRoundTrip:
         mw.image_path = str(signature_png)
         mw.save_settings()
         # Clear recent_images in settings to simulate old format
-        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        s = QSettings("PDF Sign & Fill", "PDF Sign & Fill")
         s.setValue("recent_images", "[]")
         mw.recent_images = []
         mw.load_settings()

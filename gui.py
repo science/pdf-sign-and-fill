@@ -4,7 +4,7 @@ import os
 import sys
 from datetime import date
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSettings, QEvent, QSize
+from PyQt6.QtCore import Qt, QRectF, QPointF, QPoint, QSettings, QEvent, QSize
 from PyQt6.QtGui import (
     QPixmap, QPainter, QFont, QColor, QFontDatabase,
     QKeySequence, QAction, QPen, QFontMetricsF,
@@ -16,7 +16,10 @@ from PyQt6.QtWidgets import (
     QComboBox, QColorDialog, QDialog, QFormLayout, QLineEdit,
     QDialogButtonBox, QGroupBox, QVBoxLayout, QHBoxLayout,
     QStyledItemDelegate, QStyleOptionViewItem,
+    QToolButton, QButtonGroup, QTextEdit, QMenu,
 )
+
+import fitz
 
 from pdfsign.core import PdfDocument
 
@@ -43,6 +46,25 @@ FONTS = {
     "DejaVu Serif": "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
     "DejaVu Sans Mono": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
 }
+
+def _migrate_legacy_settings():
+    """One-time migration from 'PDF Simple Signing' QSettings to 'PDF Sign & Fill'."""
+    new = QSettings("PDF Sign & Fill", "PDF Sign & Fill")
+    if new.allKeys():
+        return
+    old = QSettings("PDF Simple Signing", "PDF Simple Signing")
+    if not old.allKeys():
+        return
+    for k in old.allKeys():
+        new.setValue(k, old.value(k))
+    new.sync()
+    old.clear()
+
+
+FIELD_FILL_COLOR = QColor(60, 130, 220, 60)
+FIELD_FILL_HOVER = QColor(60, 130, 220, 100)
+FIELD_FILLED_COLOR = QColor(80, 170, 100, 70)
+FIELD_OUTLINE = QColor(40, 100, 200)
 
 HANDLE_SIZE = 8  # pixels for resize handles
 PAGE_TURN_ZONE = 80  # pixels for scroll-to-turn zone below/above page
@@ -278,6 +300,51 @@ class ImageItemDelegate(QStyledItemDelegate):
         return False
 
 
+class FillFieldDialog(QDialog):
+    """Multi-line dialog for editing a form field's value.
+
+    Pre-populated with the field's current value (a pending fill or the original
+    PDF default). Three buttons: OK saves whatever is in the box (empty included,
+    which forces the field blank on save); Clear empties and accepts in one click;
+    Cancel makes no changes.
+    """
+
+    def __init__(self, parent, field_name: str, initial_value: str):
+        super().__init__(parent)
+        self.setWindowTitle(f"Fill: {field_name}")
+        self.resize(500, 260)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"Value for {field_name}:"))
+        self.text_edit = QTextEdit()
+        self.text_edit.setAcceptRichText(False)
+        self.text_edit.setPlainText(initial_value)
+        layout.addWidget(self.text_edit)
+        button_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        clear_btn = QPushButton("Clear")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        clear_btn.clicked.connect(self._on_clear)
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addStretch()
+        button_row.addWidget(ok_btn)
+        button_row.addWidget(clear_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+        cursor = self.text_edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.text_edit.setTextCursor(cursor)
+        self.text_edit.setFocus()
+
+    def _on_clear(self):
+        self.text_edit.clear()
+        self.accept()
+
+    def value(self) -> str:
+        return self.text_edit.toPlainText()
+
+
 class PdfCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -295,6 +362,8 @@ class PdfCanvas(QWidget):
         # Page turn scroll gate
         self.turn_progress = 0  # 0 to PAGE_TURN_TICKS
         self.turn_direction = 0  # +1 = next, -1 = prev
+
+        self._hover_field: str | None = None  # field_name under cursor in Fill mode
 
         self.setMouseTracking(True)
 
@@ -448,6 +517,65 @@ class PdfCanvas(QWidget):
                     for hrect in handles.values():
                         painter.drawRect(hrect)
 
+        # Fill mode: draw form-field overlays on the current page
+        if mw.top_mode == "fill":
+            fills_by_name = {f.field_name: f.value for f in mw.doc.pending_fields()}
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for ff in mw._form_field_cache:
+                if ff.page_num != current_page:
+                    continue
+                fx0, fy0, fx1, fy1 = ff.rect
+                screen = QRectF(
+                    fx0 * zoom,
+                    fy0 * zoom + offy,
+                    (fx1 - fx0) * zoom,
+                    (fy1 - fy0) * zoom,
+                )
+                effective = fills_by_name.get(ff.field_name, ff.value)
+                if ff.widget_type in (fitz.PDF_WIDGET_TYPE_TEXT, fitz.PDF_WIDGET_TYPE_COMBOBOX):
+                    is_filled = ff.field_name in fills_by_name
+                    if is_filled:
+                        painter.fillRect(screen, QColor(255, 255, 255))
+                        painter.fillRect(screen, FIELD_FILLED_COLOR)
+                    elif self._hover_field == ff.field_name:
+                        painter.fillRect(screen, FIELD_FILL_HOVER)
+                    else:
+                        painter.fillRect(screen, FIELD_FILL_COLOR)
+                    painter.setPen(QPen(FIELD_OUTLINE, 1))
+                    painter.drawRect(screen)
+                    if is_filled and fills_by_name[ff.field_name]:
+                        painter.setPen(QColor(0, 0, 0))
+                        font = QFont()
+                        font.setPixelSize(max(8, int(min(screen.height() * 0.7, 18))))
+                        painter.setFont(font)
+                        painter.drawText(
+                            screen.adjusted(4, 0, -4, 0),
+                            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                            fills_by_name[ff.field_name],
+                        )
+                else:
+                    # Checkbox / radio: only "on" if the effective value matches this
+                    # widget's own on_state (radios in a group differ by on_state).
+                    is_on = bool(ff.on_state) and effective == ff.on_state
+                    if self._hover_field == ff.field_name:
+                        painter.fillRect(screen, FIELD_FILL_HOVER)
+                    else:
+                        painter.fillRect(screen, FIELD_FILL_COLOR)
+                    painter.setPen(QPen(FIELD_OUTLINE, 1))
+                    painter.drawRect(screen)
+                    if is_on:
+                        painter.fillRect(screen.adjusted(2, 2, -2, -2), FIELD_FILLED_COLOR)
+                        painter.setPen(QPen(QColor(0, 0, 0), 2))
+                        font = QFont()
+                        font.setPixelSize(max(10, int(min(screen.height() * 0.8, 22))))
+                        painter.setFont(font)
+                        glyph = "✓" if ff.widget_type == fitz.PDF_WIDGET_TYPE_CHECKBOX else "●"
+                        painter.drawText(
+                            screen,
+                            int(Qt.AlignmentFlag.AlignCenter),
+                            glyph,
+                        )
+
         # Draw page turn zones
         page_bottom = offy + self.base_pixmap.height()
         w = self.base_pixmap.width()
@@ -513,6 +641,10 @@ class PdfCanvas(QWidget):
         offy = getattr(self, "_page_y_offset", 0)
         pdf_x = pos.x() / mw.zoom
         pdf_y = (pos.y() - offy) / mw.zoom
+
+        if mw.top_mode == "fill":
+            self._mouse_press_fill(pdf_x, pdf_y)
+            return
 
         # Hit test existing annotations first
         hit_idx, handle = self._hit_test(pos)
@@ -584,12 +716,107 @@ class PdfCanvas(QWidget):
         self.update()
         mw.update_status()
 
+    def _mouse_press_fill(self, pdf_x, pdf_y):
+        mw = self.main_window
+        hit = self._hit_field(pdf_x, pdf_y)
+        if hit is None:
+            return
+        if hit.widget_type == fitz.PDF_WIDGET_TYPE_TEXT:
+            self._open_text_fill_dialog(hit)
+        elif hit.widget_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+            current = self._effective_field_value(hit)
+            new = "Off" if current == hit.on_state else (hit.on_state or "Yes")
+            mw.doc.fill_field(hit.field_name, new)
+            self.update()
+            mw.update_status()
+        elif hit.widget_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+            # Always select this radio (its on_state); siblings deselect on save.
+            if hit.on_state:
+                mw.doc.fill_field(hit.field_name, hit.on_state)
+                self.update()
+                mw.update_status()
+        elif hit.widget_type == fitz.PDF_WIDGET_TYPE_COMBOBOX:
+            self._open_combobox_menu(hit, pdf_x, pdf_y)
+
+    def _open_combobox_menu(self, ff, pdf_x, pdf_y):
+        mw = self.main_window
+        if not ff.choices:
+            mw.statusBar().showMessage(f"Dropdown {ff.field_name!r} has no options")
+            return
+        menu = QMenu(self)
+        current = self._effective_field_value(ff)
+        for opt in ff.choices:
+            act = menu.addAction(opt)
+            act.setCheckable(True)
+            if opt == current:
+                act.setChecked(True)
+        offy = getattr(self, "_page_y_offset", 0)
+        screen_pt = QPoint(int(pdf_x * mw.zoom), int(pdf_y * mw.zoom + offy))
+        chosen = menu.exec(self.mapToGlobal(screen_pt))
+        if chosen is None:
+            return
+        new_value = chosen.text()
+        mw.doc.fill_field(ff.field_name, new_value)
+        self.update()
+        mw.update_status()
+
+    def _open_text_fill_dialog(self, ff):
+        mw = self.main_window
+        pending = next(
+            (f for f in mw.doc.pending_fields() if f.field_name == ff.field_name),
+            None,
+        )
+        current = pending.value if pending is not None else ff.value
+        dlg = FillFieldDialog(self, ff.field_name, current)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_value = dlg.value()
+        if pending is None and new_value == current:
+            return
+        mw.doc.fill_field(ff.field_name, new_value)
+        self.update()
+        mw.update_status()
+
+    def _effective_field_value(self, ff):
+        """Pending value if set, else the original baked-in value."""
+        mw = self.main_window
+        pending = next(
+            (f for f in mw.doc.pending_fields() if f.field_name == ff.field_name),
+            None,
+        )
+        return pending.value if pending is not None else ff.value
+
+    def _hit_field(self, pdf_x, pdf_y):
+        """Return the FormField under the PDF-space point on the current page, or None."""
+        mw = self.main_window
+        for ff in mw._form_field_cache:
+            if ff.page_num != mw.current_page:
+                continue
+            x0, y0, x1, y1 = ff.rect
+            if x0 <= pdf_x <= x1 and y0 <= pdf_y <= y1:
+                return ff
+        return None
+
     def mouseMoveEvent(self, event):
         mw = self.main_window
         if mw.doc is None:
             return
 
         pos = event.position()
+
+        if mw.top_mode == "fill":
+            offy = getattr(self, "_page_y_offset", 0)
+            pdf_x = pos.x() / mw.zoom
+            pdf_y = (pos.y() - offy) / mw.zoom
+            hit = self._hit_field(pdf_x, pdf_y)
+            new_hover = hit.field_name if hit is not None else None
+            if new_hover != self._hover_field:
+                self._hover_field = new_hover
+                self.update()
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor if new_hover else Qt.CursorShape.ArrowCursor
+            )
+            return
 
         if self.dragging and self.selected_index >= 0:
             offy = getattr(self, "_page_y_offset", 0)
@@ -709,13 +936,17 @@ class PdfCanvas(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, initial_path: str | None = None):
         super().__init__()
-        self.setWindowTitle("PDF Simple Signing")
+        _migrate_legacy_settings()
+        self.setWindowTitle("PDF Sign & Fill")
         self.doc = None
         self.current_page = 0
         self.zoom = DEFAULT_ZOOM
         self.mode = "text"
+        self.top_mode = "stamp"     # "stamp" or "fill"
+        self._form_field_cache = []  # list[(page_num, field_name, rect_tuple, original_value)]
+        self._xfa_notice_shown = False
         self.image_path = ""
         self.image_sizes = {}       # {path: [w, h]} — per-image remembered sizes
         self.recent_images = []     # ordered list of recent image paths
@@ -739,6 +970,26 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar()
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
+
+        # Top-level mode toggle (Stamp / Fill)
+        self.btn_stamp = QToolButton()
+        self.btn_stamp.setText("Stamp")
+        self.btn_stamp.setCheckable(True)
+        self.btn_stamp.setChecked(True)
+        self.btn_stamp.setStyleSheet("QToolButton:checked { background: #ffe3b3; }")
+        self.btn_fill = QToolButton()
+        self.btn_fill.setText("Fill")
+        self.btn_fill.setCheckable(True)
+        self.btn_fill.setStyleSheet("QToolButton:checked { background: #d8e8ff; }")
+        self._top_mode_group = QButtonGroup(self)
+        self._top_mode_group.setExclusive(True)
+        self._top_mode_group.addButton(self.btn_stamp)
+        self._top_mode_group.addButton(self.btn_fill)
+        toolbar.addWidget(self.btn_stamp)
+        toolbar.addWidget(self.btn_fill)
+        self.btn_stamp.toggled.connect(lambda on: self.set_top_mode("stamp") if on else None)
+        self.btn_fill.toggled.connect(lambda on: self.set_top_mode("fill") if on else None)
+        toolbar.addSeparator()
 
         toolbar.addAction("Open...", self.open_file)
         toolbar.addAction("Save As...", self.save_file)
@@ -812,6 +1063,7 @@ class MainWindow(QMainWindow):
         text_toolbar.setMovable(False)
         self.addToolBarBreak()
         self.addToolBar(text_toolbar)
+        self.text_toolbar = text_toolbar
 
         text_toolbar.addWidget(QLabel("Font: "))
         self.font_combo = QComboBox()
@@ -882,12 +1134,12 @@ class MainWindow(QMainWindow):
         # Load persisted settings
         self.load_settings()
 
-        # Auto-open file dialog on launch
-        self.open_file()
+        if initial_path:
+            self.load_file(initial_path)
 
     def _settings_vars(self):
         """Return dict of variable values for template expansion."""
-        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        s = QSettings("PDF Sign & Fill", "PDF Sign & Fill")
         return {
             "name": s.value("user_name", ""),
             "date_format": s.value("date_format", _system_date_format()),
@@ -979,7 +1231,7 @@ class MainWindow(QMainWindow):
         self.recent_combo.setCurrentIndex(0)
 
     def open_settings(self):
-        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        s = QSettings("PDF Sign & Fill", "PDF Sign & Fill")
         current_name = s.value("user_name", "")
         current_date_fmt = s.value("date_format", _system_date_format())
         dlg = SettingsDialog(self, current_name, current_date_fmt)
@@ -988,7 +1240,7 @@ class MainWindow(QMainWindow):
             s.setValue("date_format", dlg.get_date_format())
 
     def load_settings(self):
-        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        s = QSettings("PDF Sign & Fill", "PDF Sign & Fill")
         # Window geometry
         geo = s.value("geometry")
         if geo:
@@ -1050,7 +1302,7 @@ class MainWindow(QMainWindow):
             self.recent_combo.addItems(recent)
 
     def save_settings(self):
-        s = QSettings("PDF Simple Signing", "PDF Simple Signing")
+        s = QSettings("PDF Sign & Fill", "PDF Sign & Fill")
         s.setValue("geometry", self.saveGeometry())
         s.setValue("image_path", self.image_path)
         s.setValue("recent_images", json.dumps(self.recent_images[:MAX_RECENT_IMAGES]))
@@ -1140,18 +1392,42 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self._last_pdf_dir = os.path.dirname(path)
-        self.doc = PdfDocument(path)
+        self.load_file(path)
+
+    def load_file(self, path: str):
+        """Load a PDF by path, without any dialog. Warn on failure, no crash."""
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "Open PDF", f"File not found: {path}")
+            return
+        try:
+            doc = PdfDocument(path)
+        except (fitz.FileDataError, RuntimeError, FileNotFoundError) as e:
+            QMessageBox.warning(self, "Open PDF", f"Could not open PDF: {e}")
+            return
+        self.doc = doc
         self.current_page = 0
         self.canvas.selected_index = -1
-        self.setWindowTitle(f"PDF Simple Signing — {path}")
+        self._last_pdf_dir = os.path.dirname(path)
+        self.setWindowTitle(f"PDF Sign & Fill — {os.path.basename(path)}")
         self.refresh_page()
+        self._after_document_loaded()
+
+    def _after_document_loaded(self):
+        """Hook called after a document is successfully loaded."""
+        self._form_field_cache = self.doc.form_fields()
+        self._xfa_notice_shown = False
+        # Auto-select mode based on whether the PDF has fillable widgets
+        if self.doc.has_widgets():
+            self.btn_fill.setChecked(True)
+        else:
+            self.btn_stamp.setChecked(True)
 
     def save_file(self):
         if self.doc is None:
             return
+        suggested = self.doc.path
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save PDF", "", "PDF Files (*.pdf)"
+            self, "Save PDF", suggested, "PDF Files (*.pdf)"
         )
         if not path:
             return
@@ -1161,6 +1437,35 @@ class MainWindow(QMainWindow):
 
     def set_mode(self, mode):
         self.mode = mode
+
+    def set_top_mode(self, new_mode):
+        self.top_mode = new_mode
+        self.text_toolbar.setEnabled(new_mode == "stamp")
+        self.canvas.selected_index = -1
+        if new_mode == "fill" and self.doc is not None:
+            has_widgets = self.doc.has_widgets()
+            is_xfa = self.doc.is_xfa()
+            if not has_widgets:
+                if not self._xfa_notice_shown:
+                    if is_xfa:
+                        msg = ("This PDF uses XFA (Adobe LiveCycle) forms, which aren't "
+                               "supported. Use Stamp mode to add values on top.")
+                    else:
+                        msg = "This PDF has no fillable form fields. Use Stamp mode."
+                    QMessageBox.information(self, "Fill mode", msg)
+                    self._xfa_notice_shown = True
+                self.btn_stamp.setChecked(True)
+                return
+            if is_xfa and not self._xfa_notice_shown:
+                QMessageBox.information(
+                    self, "Fill mode",
+                    "This PDF includes XFA content. Fill mode will work with the "
+                    "standard fields; XFA-only content can't be filled — use Stamp "
+                    "mode for that.",
+                )
+                self._xfa_notice_shown = True
+        self.canvas.update()
+        self.update_status()
 
     def pick_color(self):
         r, g, b = self.text_color
@@ -1253,6 +1558,18 @@ class MainWindow(QMainWindow):
     def update_status(self):
         if self.doc is None:
             return
+        if self.top_mode == "fill":
+            names_on_page = {
+                ff.field_name for ff in self._form_field_cache
+                if ff.page_num == self.current_page
+            }
+            filled_names = {f.field_name for f in self.doc.pending_fields()}
+            n_fields = len(names_on_page)
+            n_filled = len(names_on_page & filled_names)
+            self.statusBar().showMessage(
+                f"Fill mode — {n_filled}/{n_fields} fields filled on this page"
+            )
+            return
         n = len(self.doc.pending_annotations())
         sel = ""
         if self.canvas.selected_index >= 0:
@@ -1262,7 +1579,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    window = MainWindow()
+    initial_path = sys.argv[1] if len(sys.argv) > 1 else None
+    window = MainWindow(initial_path=initial_path)
     window.show()
     sys.exit(app.exec())
 

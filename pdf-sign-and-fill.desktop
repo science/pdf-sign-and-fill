@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PDF Sign & Fill
+Comment=Stamp text/images onto PDFs and fill AcroForm fields
+Exec=/home/steve/.local/bin/pdf-sign-and-fill %f
+Icon=/home/steve/.local/share/icons/pdf-sign-and-fill.svg
+Terminal=false
+Categories=Office;Graphics;
+Keywords=pdf;sign;stamp;signature;annotation;form;fill;
+MimeType=application/pdf;

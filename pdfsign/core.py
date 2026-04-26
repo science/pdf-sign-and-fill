@@ -1,25 +1,47 @@
 from dataclasses import dataclass, field
+from typing import NamedTuple
 import os
 
 import fitz  # PyMuPDF
+
+
+SUPPORTED_WIDGET_TYPES = (
+    fitz.PDF_WIDGET_TYPE_TEXT,
+    fitz.PDF_WIDGET_TYPE_CHECKBOX,
+    fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
+    fitz.PDF_WIDGET_TYPE_COMBOBOX,
+)
+
+
+class FormField(NamedTuple):
+    page_num: int
+    field_name: str
+    rect: tuple   # (x0, y0, x1, y1)
+    value: str    # current/baked-in value
+    widget_type: int
+    on_state: str  # checkbox/radio export value (e.g. 'Yes', 'Male'); '' for text/combobox
+    choices: tuple = ()  # combobox options; () for other types
 
 
 # Undo action types
 @dataclass
 class AddAction:
     index: int
+    list_name: str = "annotations"
 
 
 @dataclass
 class RemoveAction:
     index: int
-    annotation: object  # Annotation
+    annotation: object  # Annotation or FieldFill
+    list_name: str = "annotations"
 
 
 @dataclass
 class UpdateAction:
     index: int
     old_values: dict
+    list_name: str = "annotations"
 
 
 @dataclass
@@ -44,6 +66,12 @@ class Annotation:
     height: float = 0.0
 
 
+@dataclass
+class FieldFill:
+    field_name: str   # fully-qualified AcroForm name, globally unique in the doc
+    value: str
+
+
 class PdfDocument:
     def __init__(self, path: str):
         if not os.path.exists(path):
@@ -51,10 +79,15 @@ class PdfDocument:
         self._path = path
         self._doc = fitz.open(path)
         self._annotations: list[Annotation] = []
+        self._fields: list[FieldFill] = []
         self._undo_stack: list = []
         self._saved_at_depth: int = 0
         self._edit_snapshot: dict | None = None
         self._edit_index: int | None = None
+
+    @property
+    def path(self) -> str:
+        return self._path
 
     def page_count(self) -> int:
         return len(self._doc)
@@ -100,6 +133,73 @@ class PdfDocument:
     def pending_annotations(self) -> list[Annotation]:
         return list(self._annotations)
 
+    def pending_fields(self) -> list[FieldFill]:
+        return list(self._fields)
+
+    def has_widgets(self) -> bool:
+        return any(list(page.widgets() or []) for page in self._doc)
+
+    def is_xfa(self) -> bool:
+        try:
+            root_xref = self._doc.pdf_catalog()
+            val = self._doc.xref_get_key(root_xref, "AcroForm")
+        except Exception:
+            return False
+        return val is not None and val[0] == "dict" and "/XFA" in val[1]
+
+    def form_fields(self) -> list[FormField]:
+        """Enumerate fillable widgets (text, checkbox, radio).
+
+        For radios, each member of the group appears as a separate FormField
+        entry sharing the same field_name but with a distinct rect and on_state.
+        """
+        out = []
+        for page_num, page in enumerate(self._doc):
+            for w in (page.widgets() or []):
+                if w.field_type not in SUPPORTED_WIDGET_TYPES:
+                    continue
+                r = w.rect
+                on_state = ""
+                choices: tuple = ()
+                if w.field_type in (fitz.PDF_WIDGET_TYPE_CHECKBOX, fitz.PDF_WIDGET_TYPE_RADIOBUTTON):
+                    try:
+                        on_state = w.on_state() or ""
+                    except Exception:
+                        on_state = ""
+                    if on_state is True:  # PyMuPDF returns True for not-yet-saved radios
+                        on_state = ""
+                elif w.field_type == fitz.PDF_WIDGET_TYPE_COMBOBOX:
+                    choices = tuple(w.choice_values or ())
+                out.append(FormField(
+                    page_num=page_num,
+                    field_name=w.field_name,
+                    rect=(r.x0, r.y0, r.x1, r.y1),
+                    value=w.field_value or "",
+                    widget_type=w.field_type,
+                    on_state=on_state,
+                    choices=choices,
+                ))
+        return out
+
+    def fill_field(self, field_name: str, value: str):
+        """Fill a form field by name. Empty value forces the widget blank on save,
+        overriding any default value baked into the source PDF."""
+        existing_idx = next(
+            (i for i, f in enumerate(self._fields) if f.field_name == field_name),
+            None,
+        )
+        if existing_idx is not None:
+            old = self._fields[existing_idx].value
+            if old == value:
+                return
+            self._undo_stack.append(
+                UpdateAction(existing_idx, {"value": old}, list_name="fields")
+            )
+            self._fields[existing_idx].value = value
+        else:
+            self._fields.append(FieldFill(field_name=field_name, value=value))
+            self._undo_stack.append(AddAction(len(self._fields) - 1, list_name="fields"))
+
     def begin_edit(self, index: int):
         """Snapshot annotation state before a drag/resize series."""
         if index < 0 or index >= len(self._annotations):
@@ -141,16 +241,18 @@ class PdfDocument:
         if not self._undo_stack:
             return False
         action = self._undo_stack.pop()
-        if isinstance(action, AddAction):
-            self._annotations.pop(action.index)
-        elif isinstance(action, RemoveAction):
-            self._annotations.insert(action.index, action.annotation)
-        elif isinstance(action, UpdateAction):
-            ann = self._annotations[action.index]
-            for key, value in action.old_values.items():
-                setattr(ann, key, value)
-        elif isinstance(action, ClearAction):
+        if isinstance(action, ClearAction):
             self._annotations = list(action.annotations)
+            return True
+        target = self._fields if getattr(action, "list_name", "annotations") == "fields" else self._annotations
+        if isinstance(action, AddAction):
+            target.pop(action.index)
+        elif isinstance(action, RemoveAction):
+            target.insert(action.index, action.annotation)
+        elif isinstance(action, UpdateAction):
+            item = target[action.index]
+            for key, value in action.old_values.items():
+                setattr(item, key, value)
         return True
 
     def clear(self):
@@ -182,5 +284,40 @@ class PdfDocument:
                 rect = fitz.Rect(ann.x, ann.y,
                                  ann.x + ann.width, ann.y + ann.height)
                 page.insert_image(rect, filename=ann.image_path)
+        if self._fields:
+            pending_by_name = {f.field_name: f.value for f in self._fields}
+            radio_parent_xrefs: set[int] = set()
+            for page in doc:
+                for w in (page.widgets() or []):
+                    if w.field_type not in SUPPORTED_WIDGET_TYPES:
+                        continue
+                    if w.field_name not in pending_by_name:
+                        continue
+                    new_value = pending_by_name[w.field_name]
+                    if w.field_type == fitz.PDF_WIDGET_TYPE_TEXT and new_value == "":
+                        # PyMuPDF's update() silently ignores empty values for text,
+                        # leaving any baked-in default in /V. Clear /V and /AP directly.
+                        doc.xref_set_key(w.xref, "V", "()")
+                        doc.xref_set_key(w.xref, "AP", "null")
+                    elif w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                        # Each child radio's /AS must name its on_state when selected,
+                        # /Off otherwise. The parent's /V is set once after the loop.
+                        try:
+                            this_on = w.on_state() or ""
+                        except Exception:
+                            this_on = ""
+                        if this_on == new_value:
+                            doc.xref_set_key(w.xref, "AS", f"/{new_value}")
+                        else:
+                            doc.xref_set_key(w.xref, "AS", "/Off")
+                        # Remember parent xref so we can write /V after the loop
+                        ptype, pval = doc.xref_get_key(w.xref, "Parent")
+                        if ptype == "xref":
+                            radio_parent_xrefs.add((int(pval.split()[0]), new_value))
+                    else:
+                        w.field_value = new_value
+                        w.update()
+            for parent_xref, value in radio_parent_xrefs:
+                doc.xref_set_key(parent_xref, "V", f"/{value}")
         doc.save(output_path, garbage=4, deflate=True)
         doc.close()

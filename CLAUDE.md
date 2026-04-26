@@ -1,6 +1,6 @@
-# PDF Simple Signing
+# PDF Sign & Fill
 
-Minimal tool to stamp text and images onto PDFs and save flattened output. Uses PyMuPDF to write directly to page content streams without parsing/re-rendering the original PDF layout.
+Linux tool to stamp text/images onto PDFs and fill AcroForm fields, saving output that round-trips in any standards-compliant viewer. Uses PyMuPDF to write directly to page content streams (for stamps) and to update widget values in place (for form fills) without parsing/re-rendering the original PDF layout.
 
 ## Project Structure
 
