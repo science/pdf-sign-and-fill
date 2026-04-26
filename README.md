@@ -6,7 +6,7 @@ Unlike LibreOffice Draw, Okular, or Evince, this tool does **not** parse or re-r
 
 ## Why this exists (Linux-only, by design)
 
-On Windows and macOS, [Foxit Reader](https://www.foxit.com/) is a free, no-fuss PDF tool that handles signing (overlay typing/image stamps) and form filling fluently. Foxit isn't available on Linux. The standard Linux PDF tools — Okular, Evince, Xreader, qpdfview — are excellent **readers** but don't fill AcroForm fields and don't support typing/stamping freeform overlays onto a page. LibreOffice Draw can edit some PDFs but re-renders layouts in ways that break complex documents. This project fills the gap: a tiny PyQt6 + PyMuPDF app focused on stamping and form-filling, nothing more. **Targeting Linux only is intentional** — Foxit covers Windows and macOS users, so spending engineering effort on a cross-platform installer would be redundant.
+On Windows and macOS, [Foxit Reader](https://www.foxit.com/) is a free, no-fuss PDF tool that handles signing (overlay typing/image stamps) and form filling fluently. Foxit isn't available on Linux. The standard Linux PDF tools — Okular, Evince, Xreader, qpdfview — are excellent **readers** but don't reliably fill AcroForm fields or support easily typing/stamping freeform overlays onto a page. LibreOffice Draw can edit some PDFs but re-renders layouts in ways that break complex documents. This project fills the gap: a tiny PyQt6 + PyMuPDF app focused on stamping and form-filling, nothing more. **Targeting Linux only is intentional** — Foxit covers Windows and macOS users, so spending engineering effort on a cross-platform installer would be redundant.
 
 ## Installation
 
