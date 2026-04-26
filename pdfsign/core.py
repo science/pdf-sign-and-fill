@@ -64,6 +64,10 @@ class Annotation:
     image_path: str = ""
     width: float = 0.0
     height: float = 0.0
+    # When set on a text annotation, render as a wrapped textbox with this width
+    # (in PDF points). When None, text is drawn at (x, y) as a single line at the
+    # baseline. In textbox mode, (x, y) is the rect's top-left instead.
+    wrap_width: float | None = None
 
 
 @dataclass
@@ -109,12 +113,14 @@ class PdfDocument:
 
     def add_text(self, page_num: int, x: float, y: float, text: str,
                  font_path: str, font_size: float = 12.0,
-                 color: tuple = (0.0, 0.0, 0.0)):
+                 color: tuple = (0.0, 0.0, 0.0), *,
+                 wrap_width: float | None = None):
         if page_num < 0 or page_num >= len(self._doc):
             raise IndexError(f"Page {page_num} out of range")
         self._annotations.append(Annotation(
             type="text", page_num=page_num, x=x, y=y,
             text=text, font_path=font_path, font_size=font_size, color=color,
+            wrap_width=wrap_width,
         ))
         self._undo_stack.append(AddAction(len(self._annotations) - 1))
 
@@ -273,13 +279,26 @@ class PdfDocument:
         for ann in self._annotations:
             page = doc[ann.page_num]
             if ann.type == "text":
-                page.insert_text(
-                    point=fitz.Point(ann.x, ann.y),
-                    text=ann.text,
-                    fontfile=ann.font_path,
-                    fontsize=ann.font_size,
-                    color=ann.color,
-                )
+                if ann.wrap_width is None:
+                    page.insert_text(
+                        point=fitz.Point(ann.x, ann.y),
+                        text=ann.text,
+                        fontfile=ann.font_path,
+                        fontsize=ann.font_size,
+                        color=ann.color,
+                    )
+                else:
+                    rect = fitz.Rect(
+                        ann.x, ann.y,
+                        ann.x + ann.wrap_width, page.rect.height,
+                    )
+                    page.insert_textbox(
+                        rect, ann.text,
+                        fontfile=ann.font_path,
+                        fontsize=ann.font_size,
+                        color=ann.color,
+                        align=fitz.TEXT_ALIGN_LEFT,
+                    )
             elif ann.type == "image":
                 rect = fitz.Rect(ann.x, ann.y,
                                  ann.x + ann.width, ann.y + ann.height)

@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 import fitz
 
 from pdfsign.core import PdfDocument
+from pdfsign.geometry import fit_image_to_bbox, normalize_bbox
 
 DEFAULT_TEXT = f"Signed {date.today()}"
 
@@ -359,6 +360,11 @@ class PdfCanvas(QWidget):
         self.resizing = False
         self.resize_handle = None  # which handle is being dragged
 
+        # Drag-to-draw bounding-box state (stamp mode, empty area)
+        self.bbox_press_screen: QPointF | None = None
+        self.bbox_current_screen: QPointF | None = None
+        self.bbox_active = False  # flips True once drag passes startDragDistance
+
         # Page turn scroll gate
         self.turn_progress = 0  # 0 to PAGE_TURN_TICKS
         self.turn_direction = 0  # +1 = next, -1 = prev
@@ -405,6 +411,19 @@ class PdfCanvas(QWidget):
             font = QFont(font_family)
             font.setPixelSize(max(1, int(ann.font_size * zoom)))
             fm = QFontMetricsF(font)
+            if ann.wrap_width is not None:
+                # Textbox mode: (ann.x, ann.y) is top-left; bbox is wrap_width
+                # wide and as tall as the wrapped layout.
+                wrap_w_screen = ann.wrap_width * zoom
+                flags = int(
+                    Qt.TextFlag.TextWordWrap
+                    | Qt.AlignmentFlag.AlignTop
+                    | Qt.AlignmentFlag.AlignLeft
+                )
+                layout = fm.boundingRect(
+                    QRectF(0, 0, wrap_w_screen, 1e6), flags, ann.text
+                )
+                return QRectF(sx, sy, wrap_w_screen, layout.height())
             br = fm.boundingRect(ann.text)
             # drawText uses baseline at (sx, sy), so text extends upward
             return QRectF(sx + br.x(), sy + br.y(), br.width(), br.height())
@@ -494,7 +513,18 @@ class PdfCanvas(QWidget):
                 painter.setFont(font)
                 r, g, b = ann.color
                 painter.setPen(QColor(int(r * 255), int(g * 255), int(b * 255)))
-                painter.drawText(int(sx), int(sy), ann.text)
+                if ann.wrap_width is not None:
+                    rect_w = ann.wrap_width * zoom
+                    page_h_screen = self.base_pixmap.height()
+                    rect = QRectF(sx, sy, rect_w, max(0, page_h_screen - (sy - offy)))
+                    flags = int(
+                        Qt.TextFlag.TextWordWrap
+                        | Qt.AlignmentFlag.AlignTop
+                        | Qt.AlignmentFlag.AlignLeft
+                    )
+                    painter.drawText(rect, flags, ann.text)
+                else:
+                    painter.drawText(int(sx), int(sy), ann.text)
             elif ann.type == "image":
                 pixmap = QPixmap(ann.image_path)
                 target = QRectF(sx, sy, ann.width * zoom, ann.height * zoom)
@@ -516,6 +546,15 @@ class PdfCanvas(QWidget):
                     painter.setBrush(QColor(255, 255, 255))
                     for hrect in handles.values():
                         painter.drawRect(hrect)
+
+        # Drag-to-draw bbox rubber band (stamp mode)
+        if (self.bbox_press_screen is not None
+                and self.bbox_current_screen is not None
+                and self.bbox_active):
+            rubber = QRectF(self.bbox_press_screen, self.bbox_current_screen).normalized()
+            painter.setPen(QPen(QColor(0, 120, 215), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(rubber)
 
         # Fill mode: draw form-field overlays on the current page
         if mw.top_mode == "fill":
@@ -677,9 +716,17 @@ class PdfCanvas(QWidget):
             self.update()
             return
 
-        # Nothing hit — deselect and create new annotation
+        # Nothing hit — start a potential drag-draw. Defer placement until
+        # release, so a tiny drag (below startDragDistance) can fall through to
+        # the existing click-to-place behavior.
         self.selected_index = -1
+        self.bbox_press_screen = pos
+        self.bbox_current_screen = pos
+        self.bbox_active = False
+        self.update()
 
+    def _place_at_click(self, page_num, pdf_x, pdf_y):
+        mw = self.main_window
         if mw.mode == "text":
             template = mw.recent_combo.currentText() or DEFAULT_TEXT
             expanded = mw._expand_text(template)
@@ -687,11 +734,10 @@ class PdfCanvas(QWidget):
                 self, "Add Text", "Text:", text=expanded,
             )
             if not ok or not text:
-                self.update()
                 return
             mw._add_recent_text(template)
             mw.doc.add_text(
-                mw.current_page, pdf_x, pdf_y,
+                page_num, pdf_x, pdf_y,
                 text, mw.current_font_path(),
                 font_size=mw.font_size.value(),
                 color=mw.text_color,
@@ -703,18 +749,52 @@ class PdfCanvas(QWidget):
                     "Images (*.png *.gif *.jpg *.jpeg)",
                 )
                 if not path:
-                    self.update()
                     return
                 mw.image_path = path
                 mw._add_recent_image(path)
             w, h = mw.get_image_size(mw.image_path)
             mw.doc.add_image(
-                mw.current_page, pdf_x, pdf_y,
+                page_num, pdf_x, pdf_y,
                 mw.image_path, w, h,
             )
 
-        self.update()
-        mw.update_status()
+    def _place_with_bbox(self, page_num, x, y, w, h):
+        mw = self.main_window
+        if mw.mode == "text":
+            template = mw.recent_combo.currentText() or DEFAULT_TEXT
+            expanded = mw._expand_text(template)
+            text, ok = QInputDialog.getText(
+                self, "Add Text", "Text:", text=expanded,
+            )
+            if not ok or not text:
+                return
+            mw._add_recent_text(template)
+            mw.doc.add_text(
+                page_num, x, y,
+                text, mw.current_font_path(),
+                font_size=mw.font_size.value(),
+                color=mw.text_color,
+                wrap_width=w,
+            )
+        elif mw.mode == "image":
+            if not mw.image_path:
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Choose Image", "",
+                    "Images (*.png *.gif *.jpg *.jpeg)",
+                )
+                if not path:
+                    return
+                mw.image_path = path
+                mw._add_recent_image(path)
+            pm = QPixmap(mw.image_path)
+            if pm.isNull():
+                return
+            fit_w, fit_h = fit_image_to_bbox(pm.width(), pm.height(), w, h)
+            if fit_w < 1 or fit_h < 1:
+                return
+            # Note: deliberately do not call mw.remember_image_size — drag-draw
+            # placement must not change the per-image-path remembered default.
+            mw.doc.add_image(page_num, x, y, mw.image_path, fit_w, fit_h)
 
     def _mouse_press_fill(self, pdf_x, pdf_y):
         mw = self.main_window
@@ -818,6 +898,15 @@ class PdfCanvas(QWidget):
             )
             return
 
+        if self.bbox_press_screen is not None:
+            self.bbox_current_screen = pos
+            if not self.bbox_active:
+                delta = pos - self.bbox_press_screen
+                if delta.manhattanLength() >= QApplication.startDragDistance():
+                    self.bbox_active = True
+            self.update()
+            return
+
         if self.dragging and self.selected_index >= 0:
             offy = getattr(self, "_page_y_offset", 0)
             new_x = (pos.x() - self.drag_offset.x()) / mw.zoom
@@ -901,24 +990,50 @@ class PdfCanvas(QWidget):
             self.setCursor(Qt.CursorShape.CrossCursor)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            was_dragging = self.dragging
-            was_resizing = self.resizing
-            self.dragging = False
-            self.resizing = False
-            self.resize_handle = None
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        mw = self.main_window
 
-            mw = self.main_window
-            if (was_dragging or was_resizing) and mw.doc:
-                mw.doc.commit_edit()
+        if self.bbox_press_screen is not None:
+            press = self.bbox_press_screen
+            current = self.bbox_current_screen
+            active = self.bbox_active
+            self.bbox_press_screen = None
+            self.bbox_current_screen = None
+            self.bbox_active = False
+            if mw.doc is None:
+                self.update()
+                return
+            offy = getattr(self, "_page_y_offset", 0)
+            px1 = press.x() / mw.zoom
+            py1 = (press.y() - offy) / mw.zoom
+            if not active:
+                self._place_at_click(mw.current_page, px1, py1)
+            else:
+                px2 = current.x() / mw.zoom
+                py2 = (current.y() - offy) / mw.zoom
+                x, y, w, h = normalize_bbox((px1, py1), (px2, py2))
+                self._place_with_bbox(mw.current_page, x, y, w, h)
+            self.update()
+            mw.update_status()
+            return
 
-            if was_resizing and self.selected_index >= 0:
-                if mw.doc:
-                    anns = mw.doc.pending_annotations()
-                    if self.selected_index < len(anns):
-                        ann = anns[self.selected_index]
-                        if ann.type == "image":
-                            mw.remember_image_size(ann.image_path, ann.width, ann.height)
+        was_dragging = self.dragging
+        was_resizing = self.resizing
+        self.dragging = False
+        self.resizing = False
+        self.resize_handle = None
+
+        if (was_dragging or was_resizing) and mw.doc:
+            mw.doc.commit_edit()
+
+        if was_resizing and self.selected_index >= 0:
+            if mw.doc:
+                anns = mw.doc.pending_annotations()
+                if self.selected_index < len(anns):
+                    ann = anns[self.selected_index]
+                    if ann.type == "image":
+                        mw.remember_image_size(ann.image_path, ann.width, ann.height)
 
     def keyPressEvent(self, event):
         mw = self.main_window

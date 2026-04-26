@@ -1,6 +1,7 @@
 """GUI unit tests — TDD Red/Green cycles."""
 
 from datetime import date
+from unittest.mock import patch
 
 from gui import expand_variables, MAX_RECENT_IMAGES
 
@@ -342,3 +343,136 @@ class TestSpinboxWiring:
         mw.image_path = "/tmp/a.png"
         mw.remember_image_size("/tmp/a.png", 300, 100)
         assert mw.image_sizes["/tmp/a.png"] == [300, 100]
+
+
+class TestDragDrawBbox:
+    def test_place_with_bbox_image_does_not_update_remembered_size(
+        self, main_window, signature_png, simple_pdf
+    ):
+        from pdfsign.core import PdfDocument
+        mw = main_window
+        mw.doc = PdfDocument(simple_pdf)
+        mw.current_page = 0
+        mw.image_path = str(signature_png)
+        mw.image_sizes[str(signature_png)] = [150, 50]
+        mw.set_mode("image")
+        # Drag-draw a 400x400 bbox that fits the signature differently than the remembered size.
+        mw.canvas._place_with_bbox(0, 50, 50, 400, 400)
+        assert mw.image_sizes[str(signature_png)] == [150, 50], \
+            "drag-draw must not update the remembered default size"
+        anns = mw.doc.pending_annotations()
+        assert len(anns) == 1
+        assert anns[0].type == "image"
+        # And the placed dims should reflect the bbox fit, not the remembered size.
+        assert (anns[0].width, anns[0].height) != (150, 50)
+
+    def test_place_with_bbox_image_preserves_aspect_ratio(
+        self, main_window, signature_png, simple_pdf
+    ):
+        from PyQt6.QtGui import QPixmap
+        from pdfsign.core import PdfDocument
+        mw = main_window
+        mw.doc = PdfDocument(simple_pdf)
+        mw.current_page = 0
+        mw.image_path = str(signature_png)
+        mw.set_mode("image")
+        pm = QPixmap(str(signature_png))
+        mw.canvas._place_with_bbox(0, 0, 0, 200, 200)
+        ann = mw.doc.pending_annotations()[0]
+        # Aspect ratio of placed image matches source within rounding.
+        src_aspect = pm.width() / pm.height()
+        out_aspect = ann.width / ann.height
+        assert abs(src_aspect - out_aspect) < 1e-6
+
+    def test_place_with_bbox_text_passes_wrap_width(self, main_window, simple_pdf):
+        from pdfsign.core import PdfDocument
+        mw = main_window
+        mw.doc = PdfDocument(simple_pdf)
+        mw.current_page = 0
+        mw.set_mode("text")
+        with patch("gui.QInputDialog.getText", return_value=("hello world", True)):
+            mw.canvas._place_with_bbox(0, 50, 60, 120, 40)
+        anns = mw.doc.pending_annotations()
+        assert len(anns) == 1
+        assert anns[0].type == "text"
+        assert anns[0].wrap_width == 120
+        assert (anns[0].x, anns[0].y) == (50, 60)
+
+    def test_place_at_click_text_has_no_wrap_width(self, main_window, simple_pdf):
+        from pdfsign.core import PdfDocument
+        mw = main_window
+        mw.doc = PdfDocument(simple_pdf)
+        mw.current_page = 0
+        mw.set_mode("text")
+        with patch("gui.QInputDialog.getText", return_value=("hi", True)):
+            mw.canvas._place_at_click(0, 50, 60)
+        anns = mw.doc.pending_annotations()
+        assert anns[0].wrap_width is None
+
+    def test_short_drag_falls_through_to_click_place(self, main_window, simple_pdf):
+        from PyQt6.QtCore import Qt, QPointF, QEvent
+        from PyQt6.QtGui import QMouseEvent
+        from pdfsign.core import PdfDocument
+        mw = main_window
+        mw.doc = PdfDocument(simple_pdf)
+        mw.current_page = 0
+        mw.zoom = 1.0
+        mw.refresh_page()
+        mw.set_mode("text")
+        # Simulate press, no movement, release at same point.
+        press_pos = QPointF(100, 100)
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress, press_pos,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        mw.canvas.mousePressEvent(press)
+        assert mw.canvas.bbox_press_screen is not None
+        with patch("gui.QInputDialog.getText", return_value=("clicked", True)):
+            release = QMouseEvent(
+                QEvent.Type.MouseButtonRelease, press_pos,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            mw.canvas.mouseReleaseEvent(release)
+        anns = mw.doc.pending_annotations()
+        assert len(anns) == 1
+        assert anns[0].text == "clicked"
+        assert anns[0].wrap_width is None  # click-place: point mode
+
+    def test_long_drag_uses_bbox_place_with_wrap(self, main_window, simple_pdf):
+        from PyQt6.QtCore import Qt, QPointF, QEvent
+        from PyQt6.QtGui import QMouseEvent
+        from pdfsign.core import PdfDocument
+        mw = main_window
+        mw.doc = PdfDocument(simple_pdf)
+        mw.current_page = 0
+        mw.zoom = 1.0
+        mw.refresh_page()
+        mw.set_mode("text")
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(100, 100),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        mw.canvas.mousePressEvent(press)
+        # Move 200px — well past startDragDistance.
+        move = QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(300, 180),
+            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        mw.canvas.mouseMoveEvent(move)
+        assert mw.canvas.bbox_active
+        with patch("gui.QInputDialog.getText", return_value=("wrapped", True)):
+            release = QMouseEvent(
+                QEvent.Type.MouseButtonRelease, QPointF(300, 180),
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            mw.canvas.mouseReleaseEvent(release)
+        anns = mw.doc.pending_annotations()
+        assert len(anns) == 1
+        assert anns[0].text == "wrapped"
+        assert anns[0].wrap_width == 200  # bbox width at zoom=1.0
+        assert (anns[0].x, anns[0].y) == (100, 100)

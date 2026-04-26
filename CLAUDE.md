@@ -8,14 +8,16 @@ Linux tool to stamp text/images onto PDFs and fill AcroForm fields, saving outpu
 pdfsign/
 ├── core.py              # Core API: PdfDocument class
 ├── cli.py               # CLI interface
+├── geometry.py          # Pure helpers: normalize_bbox, fit_image_to_bbox
 tests/
 ├── conftest.py          # Shared fixtures
 ├── test_open.py         # Open/inspect tests
 ├── test_text.py         # Text insertion tests
 ├── test_image.py        # Image overlay tests
 ├── test_save.py         # Save/flatten tests
+├── test_geometry.py     # normalize_bbox + fit_image_to_bbox tests
 fixtures/                # Test PDF and image files
-gui.py                   # PyQt6 GUI (future)
+gui.py                   # PyQt6 GUI
 ```
 
 ## Running Tests

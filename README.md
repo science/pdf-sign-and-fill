@@ -66,13 +66,17 @@ The two modes share the same save pipeline — stamps flatten, form values stay 
 1. Select **Text** mode (default)
 2. Choose font, size, and color
 3. Select or type a text template in the dropdown (supports `{date}`, `{name}`)
-4. Click on the PDF -- a dialog appears with the expanded text
-5. Edit if needed, press OK -- text appears at click position
+4. Place on the PDF:
+   - **Click** for a single point -- text appears as one line at the click
+   - **Drag** a box to set the word-wrap region -- text starts at the box's top-left, wraps at its right edge, and overflows below as needed (no truncation)
+5. A dialog appears with the expanded text; edit if needed and press OK
 
 ### Placing Images (Signatures)
 1. Select an image from the **Image:** dropdown (or choose "Choose file...")
 2. Adjust W/H dimensions if needed (remembered per image)
-3. Click on the PDF -- image is placed at that position
+3. Place on the PDF:
+   - **Click** -- image is placed at the click using the W/H above
+   - **Drag** a box -- image is anchored to the box's top-left and scaled to fit inside, preserving aspect ratio. Drag-place does *not* change the remembered W/H; only resizing a placed image via its corner handles does
 4. Subsequent clicks reuse the same image and size
 
 ### Filling Form Fields (Fill mode)
