@@ -142,3 +142,14 @@ class TestSaveEdgeCases:
         assert "Keep" in text
         assert "Remove" not in text
         result.close()
+
+    def test_save_back_to_source_path(self, simple_pdf, default_font, tmp_path):
+        # Copy the fixture to tmp so we can overwrite it without polluting fixtures/
+        src = tmp_path / "doc.pdf"
+        src.write_bytes(open(simple_pdf, "rb").read())
+        doc = PdfDocument(str(src))
+        doc.add_text(0, 72, 100, "OverwriteOK", default_font, font_size=18)
+        doc.save(str(src))  # save back to the same path -- must not raise
+        result = fitz.open(str(src))
+        assert "OverwriteOK" in result[0].get_text()
+        result.close()

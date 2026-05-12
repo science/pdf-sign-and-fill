@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import NamedTuple
 import os
+import re
 
 import fitz  # PyMuPDF
 
@@ -11,6 +13,25 @@ SUPPORTED_WIDGET_TYPES = (
     fitz.PDF_WIDGET_TYPE_RADIOBUTTON,
     fitz.PDF_WIDGET_TYPE_COMBOBOX,
 )
+
+PRODUCER_TAG = "PDF Sign & Fill"
+
+
+def _pdf_date_now() -> str:
+    return datetime.now(timezone.utc).strftime("D:%Y%m%d%H%M%S+00'00'")
+
+
+def _replace_or_inject_xmp_tag(xmp: str, tag: str, value: str) -> str:
+    pattern = re.compile(rf"<{re.escape(tag)}>[^<]*</{re.escape(tag)}>")
+    replacement = f"<{tag}>{value}</{tag}>"
+    if pattern.search(xmp):
+        return pattern.sub(replacement, xmp)
+    return re.sub(
+        r"(</rdf:Description>)",
+        f"  {replacement}\n    \\1",
+        xmp,
+        count=1,
+    )
 
 
 class FormField(NamedTuple):
@@ -338,5 +359,35 @@ class PdfDocument:
                         w.update()
             for parent_xref, value in radio_parent_xrefs:
                 doc.xref_set_key(parent_xref, "V", f"/{value}")
-        doc.save(output_path, garbage=4, deflate=True)
-        doc.close()
+        now_pdf = _pdf_date_now()
+        meta = doc.metadata or {}
+        meta["modDate"] = now_pdf
+        meta["producer"] = PRODUCER_TAG
+        doc.set_metadata(meta)
+        xmp = doc.get_xml_metadata()
+        if xmp:
+            iso_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            xmp = _replace_or_inject_xmp_tag(xmp, "xmp:ModifyDate", iso_now)
+            xmp = _replace_or_inject_xmp_tag(xmp, "xmp:MetadataDate", iso_now)
+            xmp = _replace_or_inject_xmp_tag(xmp, "pdf:Producer", PRODUCER_TAG)
+            doc.set_xml_metadata(xmp)
+        same_file = (
+            os.path.exists(output_path)
+            and os.path.samefile(output_path, self._path)
+        )
+        if same_file:
+            # PyMuPDF refuses non-incremental save back to the open path. Write
+            # to a sibling temp file then atomically replace, preserving the
+            # full-rewrite + garbage-collection semantics.
+            tmp_path = output_path + ".tmp"
+            try:
+                doc.save(tmp_path, garbage=4, deflate=True)
+                doc.close()
+                os.replace(tmp_path, output_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        else:
+            doc.save(output_path, garbage=4, deflate=True)
+            doc.close()
